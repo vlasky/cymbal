@@ -466,3 +466,83 @@ func implementorsContain(results []ImplementorResult, implementer, target string
 	}
 	return false
 }
+
+// Same-name symbols across languages must not pollute each other's refs.
+// Before the FindReferencesScoped fix, `investigate App` on the Go struct
+// returned the TSX function's call site too because refs were name-only.
+func TestInvestigateScopesRefsByLanguage(t *testing.T) {
+	t.Setenv("CYMBAL_CACHE_DIR", t.TempDir())
+	repo := t.TempDir()
+	writePhase3File(t, repo, "go.mod", "module example.com/polyglot\n\ngo 1.25\n")
+	writePhase3File(t, repo, "backend.go", `package backend
+
+type App struct {
+	Name string
+}
+
+func NewApp() *App {
+	return &App{Name: "go-app"}
+}
+`)
+	writePhase3File(t, repo, "frontend.tsx", `import React from 'react'
+
+export function App() {
+	return null
+}
+
+function helper() {
+	return App()
+}
+`)
+	runPhase3Git(t, repo, "init")
+	runPhase3Git(t, repo, "add", ".")
+	runPhase3Git(t, repo, "-c", "user.name=Cymbal Test", "-c", "user.email=cymbal@example.invalid", "commit", "-m", "initial")
+	if _, err := Index(repo, "", Options{Workers: 1, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	dbPath, err := RepoDBPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(CloseAll)
+
+	results, err := SymbolsByName(dbPath, "App")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goSym, tsxSym SymbolResult
+	for _, r := range results {
+		switch r.Language {
+		case "go":
+			goSym = r
+		case "tsx", "typescript":
+			tsxSym = r
+		}
+	}
+	if goSym.Name == "" || tsxSym.Name == "" {
+		t.Fatalf("expected both Go and TSX App symbols, got %+v", results)
+	}
+
+	goRes, err := InvestigateResolved(dbPath, goSym)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range goRes.Refs {
+		if strings.HasSuffix(ref.RelPath, ".tsx") {
+			t.Fatalf("Go App refs leaked TSX ref %s:%d", ref.RelPath, ref.Line)
+		}
+	}
+
+	tsxRes, err := InvestigateResolved(dbPath, tsxSym)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range tsxRes.Refs {
+		if strings.HasSuffix(ref.RelPath, ".go") {
+			t.Fatalf("TSX App refs leaked Go ref %s:%d", ref.RelPath, ref.Line)
+		}
+	}
+	if len(tsxRes.Refs) == 0 {
+		t.Fatal("TSX App should have at least one ref (helper calls App())")
+	}
+}

@@ -344,7 +344,7 @@ func (e *symbolExtractor) extractImport(node *sitter.Node) (symbols.Import, bool
 		return e.extractImportGo(nodeType, node)
 	case "python":
 		return e.extractImportPython(nodeType, node)
-	case "javascript", "typescript":
+	case "javascript", "typescript", "tsx":
 		return e.extractImportJS(nodeType, node)
 	case "rust":
 		return e.extractImportRust(nodeType, node)
@@ -495,7 +495,7 @@ func (e *symbolExtractor) extractRef(node *sitter.Node) (symbols.Ref, bool) {
 			return ref, true
 		}
 		return e.extractRefGoCompositeLiteral(nodeType, node)
-	case "javascript", "typescript":
+	case "javascript", "typescript", "tsx":
 		if ref, ok := e.extractRefCallExpr(nodeType, node); ok {
 			return ref, true
 		}
@@ -834,6 +834,18 @@ func (e *symbolExtractor) nodeToSymbol(node *sitter.Node, parent string, depth i
 		startCol = int(nameNode.StartPosition().Column)
 	}
 
+	// tree-sitter-swift folds leading attributes (`@MainActor`, `@objc`) and
+	// modifiers (`public`, `final`) into the declaration node, pushing
+	// node.StartPosition() above the `protocol`/`class`/`struct`/`func`
+	// keyword. Anchor the start line to the keyword so the symbol range
+	// matches what users see and what `cymbal show` extracts.
+	if e.lang == "swift" {
+		if anchor := swiftKeywordAnchor(node, kind); anchor != nil {
+			startLine = int(anchor.StartPosition().Row) + 1
+			startCol = int(anchor.StartPosition().Column)
+		}
+	}
+
 	return symbols.Symbol{
 		Name:      name,
 		Kind:      kind,
@@ -855,7 +867,7 @@ func (e *symbolExtractor) classifyNode(nodeType string, node *sitter.Node) (stri
 		return e.classifyGo(nodeType, node)
 	case "python":
 		return e.classifyPython(nodeType, node)
-	case "javascript", "typescript":
+	case "javascript", "typescript", "tsx":
 		return e.classifyJS(nodeType, node)
 	case "rust":
 		return e.classifyRust(nodeType, node)
@@ -1578,11 +1590,13 @@ func (e *symbolExtractor) extractImportSwift(nodeType string, node *sitter.Node)
 	return symbols.Import{RawPath: strings.TrimSpace(node.Utf8Text(e.src)), Language: e.lang}, true
 }
 
-// extractRefSwift emits refs for call expressions and named type uses.
-// tree-sitter-swift exposes named types as `user_type` in annotations,
-// inheritance specifiers, generics, parameter types, and return types —
-// trigger once per `user_type` and each nested occurrence is visited
-// independently by the walker.
+// extractRefSwift emits refs for call expressions, named type uses, and
+// member-access (field/property) chains. tree-sitter-swift exposes named
+// types as `user_type` in annotations, inheritance specifiers, generics,
+// parameter types, and return types — each nested occurrence is visited
+// independently by the walker. Field/property accesses appear as
+// `navigation_expression` nodes; one ref per nav-expr keeps coverage
+// without exploding the ref count.
 func (e *symbolExtractor) extractRefSwift(nodeType string, node *sitter.Node) (symbols.Ref, bool) {
 	line := int(node.StartPosition().Row) + 1
 	switch nodeType {
@@ -1593,6 +1607,17 @@ func (e *symbolExtractor) extractRefSwift(nodeType string, node *sitter.Node) (s
 		if name := swiftCalleeName(node.Child(uint(0)), e.src); name != "" {
 			return symbols.Ref{Name: name, Line: line, Language: e.lang, Kind: symbols.RefKindCall}, true
 		}
+	case "navigation_expression":
+		// Member access. When the parent is a call_expression, the call's
+		// callee handler already emits the trailing identifier (the method
+		// name). In that case fall back to capturing the receiver — i.e. the
+		// thing the method is called on, like `trackingService` in
+		// `trackingService.track(...)`. Otherwise (non-call: assignment,
+		// argument, nested navigation) capture the trailing member, so
+		// `self.sessionID = id` records a ref for `sessionID`.
+		if name := swiftNavigationRef(node, e.src); name != "" {
+			return symbols.Ref{Name: name, Line: line, Language: e.lang, Kind: symbols.RefKindUse}, true
+		}
 	case "user_type":
 		// Type mentions (annotations, generics, return types) — not calls.
 		// These are intentionally Kind=use so `trace` doesn't surface them
@@ -1602,6 +1627,76 @@ func (e *symbolExtractor) extractRefSwift(nodeType string, node *sitter.Node) (s
 		}
 	}
 	return symbols.Ref{}, false
+}
+
+// swiftKeywordAnchor returns the leading keyword node for a Swift
+// declaration so the symbol range starts at the keyword rather than at any
+// preceding attributes/modifiers (e.g. `@MainActor` on a protocol).
+// Returns nil when the input isn't a kind that takes attributes or no
+// matching keyword child is found.
+func swiftKeywordAnchor(node *sitter.Node, kind string) *sitter.Node {
+	var keywords []string
+	switch kind {
+	case "protocol":
+		keywords = []string{"protocol"}
+	case "class", "struct", "enum", "extension", "actor":
+		keywords = []string{"class", "struct", "enum", "extension", "actor", "indirect"}
+	case "function", "method":
+		keywords = []string{"func"}
+	case "constructor":
+		keywords = []string{"init"}
+	case "destructor":
+		keywords = []string{"deinit"}
+	case "field", "variable", "constant":
+		keywords = []string{"var", "let"}
+	default:
+		return nil
+	}
+	for i := range int(node.ChildCount()) {
+		c := node.Child(uint(i))
+		ck := c.Kind()
+		for _, kw := range keywords {
+			if ck == kw {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+// swiftNavigationRef returns the field/property name to record for a
+// navigation_expression. When the parent is a call_expression the trailing
+// identifier is the method (already captured by the call handler), so we
+// emit the receiver instead. Otherwise we emit the trailing identifier.
+func swiftNavigationRef(node *sitter.Node, src []byte) string {
+	parentIsCall := false
+	if p := node.Parent(); p != nil && p.Kind() == "call_expression" {
+		parentIsCall = true
+	}
+	if parentIsCall {
+		// Receiver identifier: first child of the navigation_expression.
+		if node.ChildCount() > 0 {
+			first := node.Child(uint(0))
+			if first != nil && first.Kind() == "simple_identifier" {
+				return first.Utf8Text(src)
+			}
+		}
+		return ""
+	}
+	// Trailing identifier: last navigation_suffix's simple_identifier.
+	var lastSuffix *sitter.Node
+	for i := range int(node.ChildCount()) {
+		c := node.Child(uint(i))
+		if c.Kind() == "navigation_suffix" {
+			lastSuffix = c
+		}
+	}
+	if lastSuffix != nil {
+		if id := findChildByType(lastSuffix, "simple_identifier"); id != nil {
+			return id.Utf8Text(src)
+		}
+	}
+	return ""
 }
 
 // swiftCalleeName resolves the callable name from a call_expression's first child.
@@ -2331,12 +2426,56 @@ func (e *symbolExtractor) classifyGeneric(nodeType string, node *sitter.Node) (s
 	return "", nil
 }
 
+// jsSignatureNode descends through JS/TS wrapper nodes (export_statement,
+// lexical_declaration) to the actual function/arrow_function/method_definition
+// node so parameters and return type can be located. Returns the input node
+// unchanged when it's already a function-bearing node.
+func jsSignatureNode(node *sitter.Node) *sitter.Node {
+	if node == nil {
+		return node
+	}
+	switch node.Kind() {
+	case "export_statement":
+		for i := range int(node.ChildCount()) {
+			child := node.Child(uint(i))
+			switch child.Kind() {
+			case "function_declaration", "function", "arrow_function", "method_definition":
+				return child
+			case "lexical_declaration", "variable_declaration":
+				return jsSignatureNode(child)
+			}
+		}
+	case "lexical_declaration", "variable_declaration":
+		for i := range int(node.ChildCount()) {
+			child := node.Child(uint(i))
+			if child.Kind() == "variable_declarator" {
+				if val := child.ChildByFieldName("value"); val != nil {
+					switch val.Kind() {
+					case "arrow_function", "function":
+						return val
+					}
+				}
+			}
+		}
+	}
+	return node
+}
+
 func (e *symbolExtractor) extractSignature(node *sitter.Node, kind string) string {
 	switch kind {
 	case "function", "method", "constructor", "destructor", "getter", "setter":
 		if e.lang == "swift" {
 			return swiftSignature(node, e.src)
 		}
+
+		// JS-family: classifyJS attaches the outer wrapper node (export_statement
+		// for `export function foo(...)`, lexical_declaration for
+		// `const foo = (x) => ...`). Descend to the actual function-bearing node
+		// so parameters / return type can be located.
+		if e.lang == "typescript" || e.lang == "tsx" || e.lang == "javascript" || e.lang == "jsx" {
+			node = jsSignatureNode(node)
+		}
+
 		var sig string
 
 		// Parameters: try field name first, then language-specific node types.
@@ -2414,7 +2553,7 @@ func (e *symbolExtractor) extractImplements(node *sitter.Node) []symbols.Ref {
 		return e.extractImplementsKotlin(node)
 	case "scala":
 		return e.extractImplementsScala(node)
-	case "typescript", "javascript":
+	case "typescript", "javascript", "tsx":
 		return e.extractImplementsTSJS(node)
 	case "rust":
 		return e.extractImplementsRust(node)

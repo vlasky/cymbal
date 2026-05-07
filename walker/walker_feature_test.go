@@ -183,7 +183,7 @@ func TestFeatureWalkerLanguageDetection(t *testing.T) {
 		{"test.js", "javascript"},
 		{"test.jsx", "javascript"},
 		{"test.ts", "typescript"},
-		{"test.tsx", "typescript"},
+		{"test.tsx", "tsx"},
 		{"test.rs", "rust"},
 		{"test.rb", "ruby"},
 		{"test.java", "java"},
