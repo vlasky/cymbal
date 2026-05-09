@@ -22,7 +22,7 @@ func TestForFileExtensions(t *testing.T) {
 		{"index.js", "javascript"},
 		{"App.jsx", "javascript"},
 		{"index.ts", "typescript"},
-		{"App.tsx", "typescript"},
+		{"App.tsx", "tsx"},
 		{"lib.rs", "rust"},
 		{"app.rb", "ruby"},
 		{"Main.java", "java"},
@@ -122,7 +122,7 @@ func TestForFileSpecialFilenames(t *testing.T) {
 
 func TestSupported(t *testing.T) {
 	// Languages with tree-sitter grammars
-	for _, name := range []string{"go", "python", "javascript", "typescript", "rust", "ruby", "java", "c", "cpp", "csharp", "dart", "swift", "kotlin", "lua", "php", "bash", "scala", "yaml", "elixir", "hcl", "protobuf"} {
+	for _, name := range []string{"go", "python", "javascript", "typescript", "tsx", "rust", "ruby", "java", "c", "cpp", "csharp", "dart", "swift", "kotlin", "lua", "php", "bash", "scala", "yaml", "elixir", "hcl", "protobuf"} {
 		if !Default.Supported(name) {
 			t.Errorf("Supported(%q) = false, want true", name)
 		}

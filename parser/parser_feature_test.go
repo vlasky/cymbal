@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/1broseidon/cymbal/lang"
@@ -1375,6 +1376,85 @@ func make() -> BabyTrackingService {
 	// (BabyTrackingService is also the protocol's name — confirmed via any occurrence.)
 }
 
+// Regression: field/property accesses (`self.field`, `field.method()`,
+// `self.field.subfield = x`) used to return zero refs because tree-sitter
+// `navigation_expression` nodes weren't visited by extractRefSwift.
+func TestFeatureSwiftFieldRefs(t *testing.T) {
+	src := []byte(`class TrackingService {
+    var sessionID: String = ""
+
+    init(sessionID: String) {
+        self.sessionID = sessionID
+    }
+}
+
+class AppCoordinator {
+    let trackingService: TrackingService
+
+    init(trackingService: TrackingService) {
+        self.trackingService = trackingService
+    }
+
+    func start() {
+        self.trackingService.track(event: "start")
+        trackingService.track(event: "ready")
+    }
+
+    func update(id: String) {
+        self.trackingService.sessionID = id
+    }
+}
+`)
+	result, err := ParseSource(src, "test.swift", "swift", lang.Default.TreeSitter("swift"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countRefs := func(name string) int {
+		n := 0
+		for _, r := range result.Refs {
+			if r.Name == name {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countRefs("trackingService"); got < 4 {
+		debugParseResult(t, result)
+		t.Fatalf("trackingService refs = %d, want >= 4 (assignment, two method calls, nested access)", got)
+	}
+	if got := countRefs("sessionID"); got < 2 {
+		debugParseResult(t, result)
+		t.Fatalf("sessionID refs = %d, want >= 2 (init assignment, nested access)", got)
+	}
+}
+
+// Regression: protocols with leading attributes (`@MainActor`) had their
+// symbol range start one line above the `protocol` keyword. Anchoring to
+// the keyword keeps `cymbal show`/`outline` aligned with what users grep.
+func TestFeatureSwiftAttributedProtocolStartsAtKeyword(t *testing.T) {
+	src := []byte(`import Foundation
+
+@MainActor
+protocol Tracker {
+    func track(event: String)
+}
+`)
+	result, err := ParseSource(src, "test.swift", "swift", lang.Default.TreeSitter("swift"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sym := findSymbolKind(result.Symbols, "Tracker", "protocol")
+	if sym == nil {
+		debugParseResult(t, result)
+		t.Fatal("expected Tracker protocol")
+	}
+	// `@MainActor` is L3, `protocol Tracker` is L4. The symbol must start at L4.
+	if sym.StartLine != 4 {
+		t.Errorf("Tracker.StartLine = %d, want 4 (the `protocol` keyword line)", sym.StartLine)
+	}
+}
+
 // --- C Language Feature Tests ---
 
 func TestFeatureCRefs(t *testing.T) {
@@ -2441,6 +2521,101 @@ run_task "world"
 		if findRef(result.Refs, skip) != nil {
 			debugParseResult(t, result)
 			t.Fatalf("shell builtin %q should not appear as a ref", skip)
+		}
+	}
+}
+
+// Regression: anonymous arrow fns inside JSX props were misclassified as
+// `method async` (the `async` keyword was harvested as the symbol name)
+// because .tsx files were parsed with the plain TS grammar that can't see
+// JSX. Fixed by routing .tsx through tree-sitter's TSX grammar.
+func TestFeatureTSXJsxPropArrowFnsAreNotIndexed(t *testing.T) {
+	src := []byte(`import React from 'react'
+
+export function App() {
+    return (
+        <div>
+            <button onClick={() => doThing()}>+1</button>
+            <button onClick={async () => {
+                await save()
+            }}>save</button>
+            <button onClick={async (e) => {
+                e.preventDefault()
+                await load()
+            }}>load</button>
+        </div>
+    )
+}
+`)
+	result, err := ParseSource(src, "App.tsx", "tsx", lang.Default.TreeSitter("tsx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if findSymbolKind(result.Symbols, "App", "function") == nil {
+		debugParseResult(t, result)
+		t.Fatal("expected to find App function")
+	}
+	for _, sym := range result.Symbols {
+		if sym.Name == "async" {
+			debugParseResult(t, result)
+			t.Fatalf("JSX-prop arrow fn should not produce a symbol named 'async': %+v", sym)
+		}
+		if sym.Kind == "method" && sym.Parent == "App" {
+			debugParseResult(t, result)
+			t.Fatalf("anonymous JSX-prop fn must not be indexed as a method on App: %+v", sym)
+		}
+	}
+}
+
+// Regression: signatures were missing on `export function ...` declarations
+// because classifyJS attaches the outer export_statement node to the symbol
+// and extractSignature looked for parameters on that wrapper. Same for
+// `export const fn = (x) => ...` (lexical_declaration wrapper).
+func TestFeatureTSExportFunctionsRetainSignature(t *testing.T) {
+	src := []byte(`export function fetchUser(id: string): Promise<{ id: string }> {
+    return Promise.resolve({ id })
+}
+
+export async function saveUser(
+    id: string,
+    name: string,
+): Promise<void> {
+    return
+}
+
+function helperLocal(x: number): number {
+    return x + 1
+}
+
+export const inlineConst = (id: string): string => id
+`)
+	result, err := ParseSource(src, "api.ts", "typescript", lang.Default.TreeSitter("typescript"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name        string
+		wantInclude string
+	}{
+		{"fetchUser", "(id: string)"},
+		{"saveUser", "id: string"},
+		{"helperLocal", "(x: number): number"},
+		{"inlineConst", "(id: string)"},
+	}
+	for _, tc := range cases {
+		sym := findSymbol(result.Symbols, tc.name)
+		if sym == nil {
+			debugParseResult(t, result)
+			t.Fatalf("expected to find %s", tc.name)
+		}
+		if sym.Signature == "" {
+			t.Errorf("%s: signature is empty (expected to contain %q)", tc.name, tc.wantInclude)
+			continue
+		}
+		if !strings.Contains(sym.Signature, tc.wantInclude) {
+			t.Errorf("%s: signature %q missing %q", tc.name, sym.Signature, tc.wantInclude)
 		}
 	}
 }

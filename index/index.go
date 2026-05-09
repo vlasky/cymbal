@@ -939,14 +939,14 @@ func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*Investiga
 	switch sym.Kind {
 	case "function", "method":
 		res.Kind = "function"
-		res.Refs, _ = store.FindReferences(sym.Name, 20)
-		res.Impact, _ = store.FindImpact(sym.Name, 2, 20)
+		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
+		res.Impact, _ = store.FindImpactScoped(sym.Name, sym.Language, 2, 20)
 
 	case "class", "struct", "type", "interface", "trait", "enum", "object", "mixin", "extension", "protocol", "record", "actor":
 		res.Kind = "type"
 		res.Members, _ = store.ChildSymbols(sym.Name, 50, sym.File)
 		// For types, show who references the type name.
-		res.Refs, _ = store.FindReferences(sym.Name, 20)
+		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
 		// Inheritance / conformance edges (both directions, best-effort).
 		res.Implementors, _ = store.FindImplementors(sym.Name, 20)
 		res.Implements, _ = store.FindImplements(sym.Name, 20)
@@ -954,7 +954,7 @@ func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*Investiga
 	default:
 		// Unknown kind — return source + refs as best effort.
 		res.Kind = sym.Kind
-		res.Refs, _ = store.FindReferences(sym.Name, 20)
+		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
 	}
 
 	return res, nil
@@ -993,17 +993,17 @@ func InvestigateResolved(dbPath string, sym SymbolResult) (*InvestigateResult, e
 	switch sym.Kind {
 	case "function", "method":
 		res.Kind = "function"
-		res.Refs, _ = store.FindReferences(sym.Name, 20)
-		res.Impact, _ = store.FindImpact(sym.Name, 2, 20)
+		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
+		res.Impact, _ = store.FindImpactScoped(sym.Name, sym.Language, 2, 20)
 	case "class", "struct", "type", "interface", "trait", "enum", "object", "mixin", "extension", "protocol", "record", "actor":
 		res.Kind = "type"
 		res.Members, _ = store.ChildSymbols(sym.Name, 50, sym.File)
-		res.Refs, _ = store.FindReferences(sym.Name, 20)
+		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
 		res.Implementors, _ = store.FindImplementors(sym.Name, 20)
 		res.Implements, _ = store.FindImplements(sym.Name, 20)
 	default:
 		res.Kind = sym.Kind
-		res.Refs, _ = store.FindReferences(sym.Name, 20)
+		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
 	}
 
 	return res, nil

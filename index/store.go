@@ -1018,6 +1018,66 @@ type RefResult struct {
 	Name    string `json:"name"`
 }
 
+// FindReferencesScoped is FindReferences with a language filter. When
+// language is non-empty, only refs from files in that language are returned.
+// Used by investigate paths where the target symbol is unambiguously resolved
+// and a same-language scope avoids mixing in calls to a same-named symbol in
+// another language (e.g. Go struct App vs TSX function App).
+func (s *Store) FindReferencesScoped(name, language string, limit int, kinds ...string) ([]RefResult, error) {
+	if language == "" {
+		return s.FindReferences(name, limit, kinds...)
+	}
+	if len(kinds) == 0 {
+		rows, err := s.db.Query(`
+			SELECT f.path, f.rel_path, r.line, r.name
+			FROM refs r JOIN files f ON r.file_id = f.id
+			WHERE r.name = ? AND r.language = ?
+			ORDER BY f.rel_path, r.line
+			LIMIT ?
+		`, name, language, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var results []RefResult
+		for rows.Next() {
+			var r RefResult
+			if err := rows.Scan(&r.File, &r.RelPath, &r.Line, &r.Name); err != nil {
+				return nil, err
+			}
+			results = append(results, r)
+		}
+		return results, rows.Err()
+	}
+	kindPlaceholders := strings.Repeat("?,", len(kinds))
+	kindPlaceholders = kindPlaceholders[:len(kindPlaceholders)-1]
+	args := []interface{}{name, language}
+	for _, k := range kinds {
+		args = append(args, k)
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(`
+		SELECT f.path, f.rel_path, r.line, r.name
+		FROM refs r JOIN files f ON r.file_id = f.id
+		WHERE r.name = ? AND r.language = ? AND r.kind IN (`+kindPlaceholders+`)
+		ORDER BY f.rel_path, r.line
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var results []RefResult
+	for rows.Next() {
+		var r RefResult
+		if err := rows.Scan(&r.File, &r.RelPath, &r.Line, &r.Name); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
 // FindReferences finds files that reference a symbol name.
 // By default this surfaces any ref kind (call, use, implements); pass
 // explicit kinds to restrict (e.g. "call" to skip type-mentions).
@@ -1589,6 +1649,14 @@ func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) 
 
 // FindImpact performs transitive caller analysis using BFS.
 func (s *Store) FindImpact(symbolName string, depth, limit int) ([]ImpactResult, error) {
+	return s.FindImpactScoped(symbolName, "", depth, limit)
+}
+
+// FindImpactScoped is FindImpact with a language filter. When language is
+// non-empty, only refs and enclosing-symbols from files in that language are
+// followed — used by investigate to keep cross-language same-name symbols
+// from polluting transitive caller chains.
+func (s *Store) FindImpactScoped(symbolName, language string, depth, limit int) ([]ImpactResult, error) {
 	if depth <= 0 {
 		depth = 2
 	}
@@ -1603,11 +1671,21 @@ func (s *Store) FindImpact(symbolName string, depth, limit int) ([]ImpactResult,
 	for d := 1; d <= depth && len(currentSymbols) > 0 && len(results) < limit; d++ {
 		var nextSymbols []string
 		for _, sym := range currentSymbols {
-			rows, err := s.db.Query(`
-				SELECT f.path, f.rel_path, r.line, r.name
-				FROM refs r JOIN files f ON r.file_id = f.id
-				WHERE r.name = ?
-			`, sym)
+			var rows *sql.Rows
+			var err error
+			if language == "" {
+				rows, err = s.db.Query(`
+					SELECT f.path, f.rel_path, r.line, r.name
+					FROM refs r JOIN files f ON r.file_id = f.id
+					WHERE r.name = ?
+				`, sym)
+			} else {
+				rows, err = s.db.Query(`
+					SELECT f.path, f.rel_path, r.line, r.name
+					FROM refs r JOIN files f ON r.file_id = f.id
+					WHERE r.name = ? AND r.language = ?
+				`, sym, language)
+			}
 			if err != nil {
 				continue
 			}

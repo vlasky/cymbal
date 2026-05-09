@@ -48,8 +48,16 @@ var Default = NewRegistry(
 	},
 	Language{
 		Name:       "typescript",
-		Extensions: []string{".ts", ".tsx", ".mts", ".cts"},
+		Extensions: []string{".ts", ".mts", ".cts"},
 		TreeSitter: sitter.NewLanguage(tstypescript.LanguageTypescript()),
+	},
+	Language{
+		// .tsx uses the TSX grammar so JSX parses natively. Without this split,
+		// anonymous arrow fns inside JSX props were misclassified as `method
+		// async` because the plain TS grammar can't see JSX boundaries.
+		Name:       "tsx",
+		Extensions: []string{".tsx"},
+		TreeSitter: sitter.NewLanguage(tstypescript.LanguageTSX()),
 	},
 	Language{
 		Name:       "rust",
