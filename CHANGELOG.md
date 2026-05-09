@@ -9,6 +9,18 @@ All notable changes to cymbal are documented here.
 - **OpenCode plugins now surface update notices through native OS notifications** — when a newer cymbal version is available, the OpenCode plugin shows a platform-native notification (macOS Notification Center via `osascript`, Linux via `notify-send`, Windows via PowerShell) so users see updates regardless of TUI or Desktop mode. Respects `CYMBAL_NO_UPDATE_NOTIFIER` and cymbal's per-version notification throttle. ([#23](https://github.com/1broseidon/cymbal/issues/23))
 - **New `cymbal hook notify` command** — emits a structured JSON payload with update availability, version, and install command for agent plugins that want to surface update notices outside hidden system context. Supports `--format=json|text` and `--update=cache|if-stale`.
 
+### Changed
+
+- **Bumped Go toolchain floor to 1.26.3** — resolves 10 stdlib vulnerabilities reported by `govulncheck`, including callable traces in `net` and `net/http` reached from the update notifier. CI uses `go-version-file: go.mod`; local builds with Go 1.21+ auto-fetch the new toolchain. ([#54](https://github.com/1broseidon/cymbal/pull/54))
+
+### Fixed
+
+- **`cymbal investigate` no longer leaks references across languages** — when a name resolves to a single symbol, refs and transitive impact are filtered to the resolved symbol's language, so investigating a Go `App` struct in a polyglot repo no longer returns call sites from a TSX function with the same name. `cymbal refs` keeps its documented best-effort name-only behavior.
+- **`.tsx` files are now parsed with the TSX grammar** — anonymous arrow functions inside JSX props (`onClick={async () => ...}`) were being indexed as phantom `method async` symbols because the plain TypeScript grammar can't see JSX boundaries. `.tsx` is now its own language entry using `tree-sitter-typescript`'s TSX grammar; `.ts`/`.mts`/`.cts` continue to use the TypeScript grammar.
+- **Swift field and property accesses now record references** — `cymbal refs <fieldName>` previously returned zero hits because `extractRefSwift` only handled call expressions and named type uses. Member access through `navigation_expression` (e.g. `self.field`, `field.method()`, `self.a.b = x`) now produces refs. `cymbal refs` is still best-effort and name-only.
+- **TypeScript `export function` declarations now retain their signature** — exported functions and `export const fn = (x) => …` arrow forms were emitting an empty `signature` field because signature extraction looked for parameters on the outer wrapper node. The extractor now descends through `export_statement` and `lexical_declaration` wrappers before reading parameters and return type.
+- **Swift symbol ranges anchor at the keyword, not at preceding attributes** — protocols / classes / functions decorated with `@MainActor`, `@objc`, `public`, etc. previously had their start line absorbed into the leading attributes block, so `cymbal show` and `cymbal outline` reported a range one line above the actual `protocol` / `class` / `func` keyword.
+
 ## [0.13.1] - 2026-05-06
 
 ### Changed
