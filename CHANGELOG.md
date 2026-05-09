@@ -2,7 +2,7 @@
 
 All notable changes to cymbal are documented here.
 
-## [Unreleased]
+## [0.13.2] - 2026-05-08
 
 ### Added
 
