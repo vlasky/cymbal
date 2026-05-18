@@ -2619,3 +2619,52 @@ export const inlineConst = (id: string): string => id
 		}
 	}
 }
+
+func TestFeatureTSXExportFunctionsRetainSignature(t *testing.T) {
+	src := []byte(`export function Greeting(name: string): JSX.Element {
+    return <div>{name}</div>
+}
+
+export async function LoadUser(
+    id: string,
+    fallback: string,
+): Promise<JSX.Element> {
+    return <span>{id ?? fallback}</span>
+}
+
+export const Button = (label: string): JSX.Element => <button>{label}</button>
+`)
+	result, err := ParseSource(src, "ui.tsx", "tsx", lang.Default.TreeSitter("tsx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name        string
+		wantInclude string
+	}{
+		{"Greeting", "(name: string)"},
+		{"LoadUser", "id: string"},
+		{"Button", "(label: string)"},
+	}
+	for _, tc := range cases {
+		sym := findSymbol(result.Symbols, tc.name)
+		if sym == nil {
+			debugParseResult(t, result)
+			t.Fatalf("expected to find %s", tc.name)
+		}
+		if sym.Signature == "" {
+			t.Errorf("%s: signature is empty (expected to contain %q)", tc.name, tc.wantInclude)
+			continue
+		}
+		if !strings.Contains(sym.Signature, tc.wantInclude) {
+			t.Errorf("%s: signature %q missing %q", tc.name, sym.Signature, tc.wantInclude)
+		}
+		// Bug-catcher for the parser.go:2511 precedence regression: with the bug,
+		// the tsx arm of the type_annotation branch fires regardless of sig, so a
+		// signature could end up being just a leading `:` return type with no params.
+		if strings.HasPrefix(sym.Signature, ":") {
+			t.Errorf("%s: signature %q starts with `:` — looks like return type without params", tc.name, sym.Signature)
+		}
+	}
+}

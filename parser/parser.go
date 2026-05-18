@@ -2472,7 +2472,7 @@ func (e *symbolExtractor) extractSignature(node *sitter.Node, kind string) strin
 		// for `export function foo(...)`, lexical_declaration for
 		// `const foo = (x) => ...`). Descend to the actual function-bearing node
 		// so parameters / return type can be located.
-		if e.lang == "typescript" || e.lang == "tsx" || e.lang == "javascript" || e.lang == "jsx" {
+		if e.lang == "typescript" || e.lang == "tsx" || e.lang == "javascript" {
 			node = jsSignatureNode(node)
 		}
 
@@ -2508,7 +2508,10 @@ func (e *symbolExtractor) extractSignature(node *sitter.Node, kind string) strin
 			}
 		}
 		// TypeScript type_annotation on the node (alternative to return_type field).
-		if sig != "" && e.lang == "typescript" || e.lang == "tsx" || e.lang == "javascript" || e.lang == "jsx" {
+		// Parens matter: without them, && binds tighter than ||, so the sig != ""
+		// guard would only apply to the typescript arm and tsx/javascript would
+		// silently append a type annotation onto an empty sig.
+		if sig != "" && (e.lang == "typescript" || e.lang == "tsx" || e.lang == "javascript") {
 			if ta := findChildByType(node, "type_annotation"); ta != nil && node.ChildByFieldName("return_type") == nil {
 				sig += ta.Utf8Text(e.src)
 			}
