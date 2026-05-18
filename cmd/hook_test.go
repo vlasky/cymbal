@@ -107,6 +107,102 @@ func TestDetectStopsAtPipe(t *testing.T) {
 	}
 }
 
+func TestDetectQuotedLiteralSkipped(t *testing.T) {
+	// `grep '"jsx"' file.go` — outer single quotes consumed by the shell,
+	// leaving "jsx" as the literal pattern. This is a string-value lookup,
+	// not a symbol lookup; cymbal search would be the wrong recommendation.
+	if s := detectSearchCommand([]string{"grep", "-n", `"jsx"`, "parser.go"}, ""); s.Replacement != "" {
+		t.Errorf("quoted literal query should be skipped; got %q", s.Replacement)
+	}
+	// Same shape via the stdin path (splitShellish must preserve the inner quotes).
+	fields := splitShellish(`grep -n '"jsx"' parser.go`)
+	if s := detectSearchCommand(fields, ""); s.Replacement != "" {
+		t.Errorf("quoted literal via stdin path should be skipped; got %q (fields=%v)", s.Replacement, fields)
+	}
+}
+
+func TestDetectMultiWordQuerySkipped(t *testing.T) {
+	// Phrases are never symbol names — they're literal text searches.
+	if s := detectSearchCommand([]string{"rg", "-n", "hello world", "."}, ""); s.Replacement != "" {
+		t.Errorf("multi-word query should be skipped; got %q", s.Replacement)
+	}
+}
+
+func TestDetectQueryWithNonIdentifierCharsSkipped(t *testing.T) {
+	// `=`, `:`, `/`, `<`, `>` and friends never appear in identifiers and
+	// strongly signal literal-text intent (config values, URLs, comparisons).
+	cases := []string{
+		"key=value",
+		"http://example.com",
+		"foo:bar",
+		"x<y",
+		"a&&b",
+	}
+	for _, q := range cases {
+		if s := detectSearchCommand([]string{"rg", "-n", q, "."}, ""); s.Replacement != "" {
+			t.Errorf("non-identifier query %q should be skipped; got %q", q, s.Replacement)
+		}
+	}
+}
+
+func TestDetectExplicitFilePathsSkipped(t *testing.T) {
+	// User named specific source files — they already know where to look.
+	// cymbal search is for repo-wide discovery, not line-number lookup.
+	if s := detectSearchCommand([]string{"grep", "-n", "FindUser", "parser.go", "registry.go"}, ""); s.Replacement != "" {
+		t.Errorf("explicit file targets should suppress the nudge; got %q", s.Replacement)
+	}
+	if s := detectSearchCommand([]string{"rg", "-n", "Server", "internal/api/server.ts"}, ""); s.Replacement != "" {
+		t.Errorf("path/to/file.ts target should suppress the nudge; got %q", s.Replacement)
+	}
+	if s := detectSearchCommand([]string{"rg", "Foo", "App.tsx"}, ""); s.Replacement != "" {
+		t.Errorf("App.tsx target should suppress the nudge; got %q", s.Replacement)
+	}
+}
+
+func TestDetectDirectoryTargetStillNudges(t *testing.T) {
+	// Trailing slash means directory → discovery search → nudge stays.
+	if s := detectSearchCommand([]string{"grep", "-rn", "FindUser", "src/"}, ""); s.Replacement == "" {
+		t.Errorf("directory target should still trigger nudge; got nothing")
+	}
+	// Bare `.` is a discovery root.
+	if s := detectSearchCommand([]string{"rg", "Foo", "."}, ""); s.Replacement == "" {
+		t.Errorf("`.` discovery root should still trigger nudge; got nothing")
+	}
+	// Glob is discovery.
+	if s := detectSearchCommand([]string{"rg", "Foo", "**/*.go"}, ""); s.Replacement == "" {
+		t.Errorf("glob target should still trigger nudge; got nothing")
+	}
+}
+
+func TestDetectSingleCharRegexSignalsSkipped(t *testing.T) {
+	// `|` alternation and `^…$` anchors are unambiguous regex signals.
+	// The metachar-majority gate only catches metachar-heavy patterns; these
+	// otherwise-letter-rich queries would slip through and produce a
+	// misleading nudge (`cymbal search 'worktree|git'`).
+	cases := []string{
+		"worktree|git",
+		"foo|bar",
+		"^Server$",
+		"^FindUser",
+		"Handler$",
+	}
+	for _, q := range cases {
+		if s := detectSearchCommand([]string{"rg", "-n", q, "."}, ""); s.Replacement != "" {
+			t.Errorf("regex-shaped query %q should be skipped; got %q", q, s.Replacement)
+		}
+	}
+}
+
+func TestDetectMinusEPatternIsNotMistakenForFilePath(t *testing.T) {
+	// In `rg -e Foo -e Bar.x src/`, both `Foo` and `Bar.x` are patterns,
+	// not paths. The hasExplicitFileTarget check must skip the token
+	// following `-e` so it doesn't read `Bar.x` as a file target.
+	s := detectSearchCommand([]string{"rg", "-n", "-e", "Foo", "-e", "Bar.x", "src/"}, "")
+	if s.Replacement == "" {
+		t.Errorf("-e Foo -e Bar.x src/ should still nudge (Bar.x is a pattern, not a path); got nothing")
+	}
+}
+
 // ── nudge output shape ──
 
 func TestEmitNudgeClaudeCodeJSON(t *testing.T) {
@@ -142,6 +238,15 @@ func TestEmitNudgeClaudeCodeJSON(t *testing.T) {
 	ctx, _ := hso["additionalContext"].(string)
 	if !strings.Contains(ctx, "cymbal search Foo") {
 		t.Errorf("additionalContext missing suggestion; got %q", ctx)
+	}
+	// The nudge must be advisory, not declarative — the agent should have
+	// an explicit "ignore this if your original tool was right" branch so
+	// it doesn't reflexively switch tools on every false positive.
+	if !strings.Contains(strings.ToLower(ctx), "ignore this") {
+		t.Errorf("nudge wording should give the agent an explicit ignore-branch; got %q", ctx)
+	}
+	if !strings.Contains(strings.ToLower(ctx), "literal text") {
+		t.Errorf("nudge wording should name the literal-text case explicitly; got %q", ctx)
 	}
 }
 

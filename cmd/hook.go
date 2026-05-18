@@ -228,6 +228,12 @@ func detectSearchCommand(fields []string, toolName string) Suggestion {
 		if q == "" || !looksLikeCodeQuery(q) {
 			return Suggestion{}
 		}
+		// "User already knows where to look" — explicit file paths in the
+		// remaining args mean this is a line-number lookup, not discovery.
+		// Cymbal search would be wrong here; stay silent.
+		if hasExplicitFileTarget(fields[1:], q) {
+			return Suggestion{}
+		}
 		return Suggestion{
 			Tool:        tool,
 			Replacement: fmt.Sprintf("cymbal search %s", shQuoteIfNeeded(q)),
@@ -248,6 +254,9 @@ func detectSearchCommand(fields []string, toolName string) Suggestion {
 		if q == "" || !looksLikeCodeQuery(q) {
 			return Suggestion{}
 		}
+		if hasExplicitFileTarget(fields[1:], q) {
+			return Suggestion{}
+		}
 		return Suggestion{
 			Tool:        tool,
 			Replacement: fmt.Sprintf("cymbal search %s", shQuoteIfNeeded(q)),
@@ -255,6 +264,80 @@ func detectSearchCommand(fields []string, toolName string) Suggestion {
 		}
 	}
 	return Suggestion{}
+}
+
+// hasExplicitFileTarget reports whether the args contain at least one
+// positional that looks like a specific source file (e.g. parser.go,
+// path/to/file.ts), as opposed to a discovery root (., src/, **/*.go).
+//
+// When the caller names files directly, they already know where to look —
+// suggesting cymbal search would be a regression, not an improvement.
+// The query string is passed in so we can skip it (it would otherwise be
+// the first non-flag arg).
+func hasExplicitFileTarget(args []string, query string) bool {
+	seenQuery := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "" {
+			continue
+		}
+		// Skip `-e PATTERN`, `--regexp PATTERN`, `--pattern PATTERN` pairs:
+		// the next token is a pattern, not a path.
+		if a == "-e" || a == "--regexp" || a == "--pattern" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		// First positional is the query — skip it.
+		if !seenQuery && a == query {
+			seenQuery = true
+			continue
+		}
+		if looksLikeFilePath(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeFilePath returns true for args that name a specific file rather
+// than a discovery root. We use shape heuristics (extension, no trailing
+// slash, no globs) rather than stat — the hook must run without touching
+// the filesystem.
+func looksLikeFilePath(a string) bool {
+	if a == "." || a == ".." {
+		return false
+	}
+	if strings.HasSuffix(a, "/") || strings.HasSuffix(a, `\`) {
+		return false
+	}
+	if strings.ContainsAny(a, "*?[") {
+		return false
+	}
+	// Need a `name.ext` tail where ext is 1-5 alphanumeric chars. This
+	// catches parser.go, App.tsx, path/to/file.py, but not directories
+	// like node_modules or extensionless binaries.
+	idx := strings.LastIndex(a, ".")
+	if idx <= 0 || idx == len(a)-1 {
+		return false
+	}
+	// Reject leading-dot files like ".env" where idx == 0 (already handled
+	// by idx <= 0) and trailing-slash-then-dot edge cases.
+	if strings.ContainsRune(a[idx+1:], '/') || strings.ContainsRune(a[idx+1:], '\\') {
+		return false
+	}
+	ext := a[idx+1:]
+	if len(ext) > 5 {
+		return false
+	}
+	for _, r := range ext {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
 }
 
 // isShellToolName returns true for tool names that typically wrap shell
@@ -362,6 +445,34 @@ func looksLikeCodeQuery(q string) bool {
 	if strings.HasPrefix(q, "*.") {
 		return false
 	}
+	// Literal-text signals: if outer quotes were trimmed but inner quote
+	// chars survive, the user is searching for a string value (`"jsx"`,
+	// `'foo'`), not a symbol name. Same for whitespace — multi-word
+	// queries are phrases, not identifiers.
+	if strings.ContainsAny(q, `"'`) {
+		return false
+	}
+	if strings.ContainsAny(q, " \t\n") {
+		return false
+	}
+	// Characters that can't appear in any supported-language identifier
+	// (or in a useful `cymbal search` query) — strong literal-text signal.
+	// `.` is intentionally permitted (qualified names like pkg.Func) and
+	// `-` is permitted (some search inputs use hyphens). Regex metachars
+	// are handled by the metachar-majority gate below.
+	if strings.ContainsAny(q, `/\:;=<>!@&#,~`+"`") {
+		return false
+	}
+	// Unambiguous regex signals — even one of these means the user is running
+	// a real regex search, not a symbol lookup. The metachar-majority gate
+	// below only catches metachar-heavy patterns; these single-char signals
+	// (`worktree|git`, `^Server$`) would otherwise slip through.
+	if strings.ContainsRune(q, '|') {
+		return false
+	}
+	if strings.HasPrefix(q, "^") || strings.HasSuffix(q, "$") {
+		return false
+	}
 	// Require at least one letter. "123", "---", "()" aren't code queries.
 	hasLetter := false
 	for _, r := range q {
@@ -452,7 +563,10 @@ func readNudgeInput(args []string) (fields []string, toolName string, err error)
 
 // ── nudge: output ─────────────────────────────────────────────────
 
-const nudgeTemplate = "This project is indexed by cymbal. This looks like code navigation, so start with `%s`, then use `cymbal show` or `cymbal investigate` on the result. Batch related symbols in one cymbal call when possible. %s"
+// nudgeTemplate is advisory, not declarative. It gives the agent an explicit
+// "ignore this if your original tool was correct" branch so it doesn't
+// reflexively switch tools (and apologize) for valid grep/rg use cases.
+const nudgeTemplate = "Cymbal note: this project is indexed. If your target is a symbol name (function/class/variable/constant) and you're searching repo-wide, try `%s` for ranked results with file:line in one call. If you're searching for literal text, a value inside a string, or you already know which file to read, your current command is the right tool — ignore this note. %s"
 
 func emitNudge(stdout, stderr io.Writer, format string, fields []string, s Suggestion) error {
 	cmdLine := strings.Join(fields, " ")
