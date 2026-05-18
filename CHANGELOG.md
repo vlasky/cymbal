@@ -2,6 +2,13 @@
 
 All notable changes to cymbal are documented here.
 
+## [0.13.3] - 2026-05-18
+
+### Fixed
+
+- **TS/TSX export signature precedence bug** — `extractSignature` had an operator-precedence bug at `parser/parser.go:2511` where `&&` bound tighter than `||`, so TSX and JavaScript callers silently bypassed the empty-signature guard. A function with no parameter list and a type_annotation could end up with a signature that was just the leading `:` return type. The dead `e.lang == "jsx"` arms at `:2475` and `:2511` are also removed (`.jsx` registers as `"javascript"`). Adds `TestFeatureTSXExportFunctionsRetainSignature` with a starts-with-colon bug-catcher.
+- **`cymbal hook nudge` false positives on grep/rg calls that were already correct** — the PreToolUse nudge fired on string-value lookups (`grep '"jsx"'`), line-number searches in named files (`grep Foo parser.go`), and regex queries with `|` or `^…$` anchors, pushing agents to switch to `cymbal search` when they shouldn't. Three new gates close the false positives: literal-text shape (embedded quotes, whitespace, non-identifier punctuation), explicit file targets (`name.ext` shape in args), and single-char regex signals. The nudge template is also rewritten as advisory rather than declarative, giving agents an explicit "ignore this if your original tool was right" branch instead of an implicit correction.
+
 ## [0.13.2] - 2026-05-08
 
 ### Added
