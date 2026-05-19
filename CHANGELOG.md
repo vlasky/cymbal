@@ -2,6 +2,12 @@
 
 All notable changes to cymbal are documented here.
 
+## Unreleased
+
+### Added
+
+- **Worktree federation for symbol lookup** ([#44](https://github.com/1broseidon/cymbal/issues/44)) — when cwd is inside a git worktree, `cymbal search` / `show` / `investigate` / `impact` / `trace` / `impls` / `refs` automatically include indexed sibling worktrees of the same logical repo, so symbols added in one worktree are visible from any other worktree's cwd. Results from non-current worktrees carry a `worktree` label (`[worktree:foo (feat/foo)]` in text output, `"worktree"` JSON field). Federation respects per-worktree DB boundaries — graph traversal (impact/trace/impls/refs) stays within whichever worktree owns the seed symbol, so no cross-branch graph leakage. Pass `--no-federate` to opt out, or set `--db` / `$CYMBAL_DB` to pin a single DB. Unindexed sibling worktrees are skipped with a one-line stderr note (run `cymbal index .` inside each to include them). Federation fan-out is capped at 32 worktrees.
+
 ## [0.13.3] - 2026-05-18
 
 ### Fixed

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -100,6 +101,117 @@ func RepoDBPath(repoRoot string) (string, error) {
 	h := sha256.Sum256([]byte(repoRoot))
 	hash := hex.EncodeToString(h[:8]) // 16 hex chars
 	return filepath.Join(base, "repos", hash, "index.db"), nil
+}
+
+// WorktreeInfo describes one entry from `git worktree list --porcelain`.
+// Path is the absolute working-tree path. Branch is the short branch name
+// without `refs/heads/` prefix, or empty when detached. IsBare is true for
+// the bare main repository entry.
+type WorktreeInfo struct {
+	Path   string
+	Branch string
+	IsBare bool
+}
+
+// RepoCommonDir returns the absolute path of git's "common dir" for the repo
+// rooted at repoRoot — the directory that holds shared refs/objects across
+// all worktrees of the same logical repository.
+//
+// For a regular checkout this is `<repoRoot>/.git`. For a worktree it points
+// back into the main repo's `.git` directory, which is the signal callers
+// use to detect worktree relationships.
+//
+// Returns an empty string and a nil error when git is unavailable or the
+// path isn't inside a git repository — callers treat that as "no
+// federation possible," not a hard failure.
+func RepoCommonDir(repoRoot string) (string, error) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", nil
+	}
+	cmd := exec.Command("git", "-C", repoRoot, "rev-parse", "--git-common-dir")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", nil
+	}
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(raw) {
+		raw = filepath.Join(repoRoot, raw)
+	}
+	if resolved, err := filepath.EvalSymlinks(raw); err == nil {
+		raw = resolved
+	}
+	return filepath.Clean(raw), nil
+}
+
+// EnumerateWorktrees parses `git worktree list --porcelain` and returns one
+// WorktreeInfo per linked working tree, including the main checkout.
+//
+// commonDir must be a valid git common dir (typically from RepoCommonDir).
+// Porcelain output is identical from every worktree of the same repo.
+//
+// Returns (nil, nil) when git is unavailable. An empty slice means the repo
+// has no linked worktrees (just the main checkout — which itself appears
+// in the porcelain output for non-bare repos).
+func EnumerateWorktrees(commonDir string) ([]WorktreeInfo, error) {
+	if commonDir == "" {
+		return nil, nil
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return nil, nil
+	}
+	cmd := exec.Command("git", "-C", commonDir, "worktree", "list", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseWorktreePorcelain(out), nil
+}
+
+// parseWorktreePorcelain splits porcelain output into WorktreeInfo entries.
+// Per `git help worktree` the format is:
+//
+//	worktree <path>
+//	HEAD <sha>
+//	branch refs/heads/<name>   OR   detached   OR   bare
+//	<blank line>
+//
+// Optional lines may be absent; unknown keys are tolerated (porcelain is
+// additive across git versions).
+func parseWorktreePorcelain(out []byte) []WorktreeInfo {
+	var entries []WorktreeInfo
+	var cur WorktreeInfo
+	flush := func() {
+		if cur.Path != "" {
+			entries = append(entries, cur)
+		}
+		cur = WorktreeInfo{}
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			flush()
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path := strings.TrimPrefix(line, "worktree ")
+			if resolved, err := filepath.EvalSymlinks(path); err == nil {
+				path = resolved
+			}
+			cur.Path = filepath.Clean(path)
+		case strings.HasPrefix(line, "branch "):
+			cur.Branch = strings.TrimPrefix(strings.TrimPrefix(line, "branch "), "refs/heads/")
+		case line == "bare":
+			cur.IsBare = true
+		}
+	}
+	flush()
+	return entries
 }
 
 // FindGitRoot walks up from dir to find the nearest .git directory or

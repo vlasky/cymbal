@@ -35,8 +35,8 @@ Examples:
   cymbal outline big.go -s --names | cymbal show --stdin`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		ctx, _ := cmd.Flags().GetInt("context")
 		showAll, _ := cmd.Flags().GetBool("all")
@@ -50,7 +50,7 @@ Examples:
 
 		// JSON multi mode: return a map keyed by the requested target name.
 		if jsonOut && len(targets) > 1 {
-			return showMultiJSON(dbPath, targets, ctx, showAll, includes, excludes)
+			return showMultiJSONPlan(plan, targets, ctx, showAll, includes, excludes)
 		}
 
 		multi := len(targets) > 1
@@ -60,10 +60,17 @@ Examples:
 				multiSymbolBanner(target, i == 0)
 				multiSymbolHeader(target)
 			}
+			// Pick the right DB per target — file targets route by their
+			// path's repo root; symbol targets fan out across the federation
+			// and run downstream ops against whichever DB owns the seed.
+			var dbPath string
 			var err error
 			if isFilePath(target) {
+				dbPath, _ = pickDBForFilePath(plan, target)
 				err = showFile(dbPath, target, ctx, jsonOut)
 			} else {
+				entry, _ := findSymbolEntry(plan, target)
+				dbPath = entry.Path
 				err = showSymbol(dbPath, target, ctx, jsonOut, showAll, includes, excludes)
 			}
 			if err != nil {
@@ -107,6 +114,37 @@ func showMultiJSON(dbPath string, targets []string, ctx int, showAll bool, inclu
 		if err != nil {
 			out[target] = map[string]any{"error": err.Error()}
 			continue
+		}
+		out[target] = payload
+	}
+	return writeJSON(out)
+}
+
+// showMultiJSONPlan is the federation-aware variant: each target picks its
+// own DB (file path → owning worktree; symbol → first DB in the federation
+// that resolves it). Existing callers of showMultiJSON (tests, single-DB
+// callers) keep their original signature.
+func showMultiJSONPlan(plan DBPlan, targets []string, ctx int, showAll bool, includes, excludes []string) error {
+	out := make(map[string]any, len(targets))
+	for _, target := range targets {
+		if isFilePath(target) {
+			dbPath, _ := pickDBForFilePath(plan, target)
+			payload, err := buildShowFilePayload(dbPath, target, ctx)
+			if err != nil {
+				out[target] = map[string]any{"error": err.Error()}
+				continue
+			}
+			out[target] = payload
+			continue
+		}
+		entry, _ := findSymbolEntry(plan, target)
+		payload, err := buildShowSymbolPayload(entry.Path, target, ctx, showAll, includes, excludes)
+		if err != nil {
+			out[target] = map[string]any{"error": err.Error()}
+			continue
+		}
+		if label := entry.Label(); label != "" {
+			payload = attachWorktreeLabel(payload, label)
 		}
 		out[target] = payload
 	}

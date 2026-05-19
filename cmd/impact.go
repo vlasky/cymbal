@@ -25,8 +25,8 @@ Examples:
   cymbal outline store.go -s --names | cymbal impact --stdin`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		depth, _ := cmd.Flags().GetInt("depth")
 		limit, _ := cmd.Flags().GetInt("limit")
@@ -38,14 +38,21 @@ Examples:
 		}
 
 		if graphRequested(cmd) {
-			return renderAsGraph(cmd, dbPath, names, index.GraphDirectionUp, 1)
+			// Graph rendering uses a single DB — the seed locator picks
+			// whichever federated DB owns the first requested name. Mixed
+			// graphs across worktrees would be visually confusing and would
+			// violate non-goal #1 (no cross-worktree graph traversal).
+			entry, _ := findSymbolEntry(plan, names[0])
+			return renderAsGraph(cmd, entry.Path, names, index.GraphDirectionUp, 1)
 		}
 
-		// Fetch once per symbol, then merge into a single deduplicated view.
-		merged, sourceMap, totalRaw, err := mergeImpact(dbPath, names, depth, limit)
+		// Per-symbol seed-only federation: each name routes to whichever
+		// DB owns it, callers stay within that DB.
+		merged, sourceMap, labelMap, totalRaw, err := mergeImpactPlan(plan, names, depth, limit)
 		if err != nil {
 			return err
 		}
+		_ = labelMap // attached to meta below
 		if len(merged) == 0 {
 			if len(names) == 1 {
 				return fmt.Errorf("no callers found for '%s'", names[0])
@@ -131,6 +138,9 @@ Examples:
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}
+		if wt := summarizeWorktreeLabels(names, labelMap); wt != "" {
+			meta = append(meta, kv{"worktree", wt})
+		}
 		frontmatter(meta, content.String())
 		return nil
 	},
@@ -153,19 +163,42 @@ func impactKey(r index.ImpactResult) string {
 	return fmt.Sprintf("%s:%d|%s", r.File, r.Line, r.Caller)
 }
 
-// mergeImpact runs FindImpact for each requested symbol, then dedupes callers
-// by impactKey while preserving first-seen order. sourceMap records which of
-// the requested symbols contributed each row so output can show attribution.
-// totalRaw is the pre-dedup count for reporting ("dedupe savings").
+// mergeImpact runs FindImpact for each requested symbol against a single DB.
+// Retained for back-compat with existing single-DB callers (tests).
 func mergeImpact(dbPath string, names []string, depth, limit int) ([]index.ImpactResult, map[string][]string, int, error) {
+	merged, source, _, raw, err := runMergeImpact(names, depth, limit, func(string) string { return dbPath })
+	return merged, source, raw, err
+}
+
+// mergeImpactPlan is the federation-aware variant. Each requested name routes
+// to whichever DB in plan.Federated owns the seed; downstream callers stay
+// within that DB (non-goal #1). labelMap maps each name to its worktree label.
+func mergeImpactPlan(plan DBPlan, names []string, depth, limit int) ([]index.ImpactResult, map[string][]string, map[string]string, int, error) {
+	resolve := func(name string) string {
+		entry, _ := findSymbolEntry(plan, name)
+		return entry.Path
+	}
+	labelMap := make(map[string]string, len(names))
+	for _, name := range names {
+		entry, _ := findSymbolEntry(plan, name)
+		labelMap[name] = entry.Label()
+	}
+	merged, source, _, raw, err := runMergeImpact(names, depth, limit, resolve)
+	return merged, source, labelMap, raw, err
+}
+
+// runMergeImpact factors the shared dedup logic so the single-DB and
+// federated paths don't drift apart over time.
+func runMergeImpact(names []string, depth, limit int, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, error) {
 	var merged []index.ImpactResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{} // key -> index in merged
 	totalRaw := 0
 	for _, name := range names {
+		dbPath := dbForName(name)
 		rows, err := index.FindImpact(dbPath, name, depth, limit)
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, nil, nil, 0, err
 		}
 		totalRaw += len(rows)
 		for _, r := range rows {
@@ -195,5 +228,26 @@ func mergeImpact(dbPath string, names []string, depth, limit int) ([]index.Impac
 			}
 		}
 	}
-	return merged, sourceMap, totalRaw, nil
+	return merged, sourceMap, seen, totalRaw, nil
+}
+
+// summarizeWorktreeLabels collapses per-name labels into a single meta
+// value: empty when no name came from a non-current worktree, the bare
+// label when all non-empty labels agree, or a comma-separated set when
+// names came from different worktrees.
+func summarizeWorktreeLabels(names []string, labels map[string]string) string {
+	seen := make(map[string]struct{}, len(names))
+	var ordered []string
+	for _, n := range names {
+		l := labels[n]
+		if l == "" {
+			continue
+		}
+		if _, ok := seen[l]; ok {
+			continue
+		}
+		seen[l] = struct{}{}
+		ordered = append(ordered, l)
+	}
+	return strings.Join(ordered, ",")
 }

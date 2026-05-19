@@ -37,8 +37,8 @@ Examples:
   cymbal impls Foo --json                   # structured output for agents`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		limit, _ := cmd.Flags().GetInt("limit")
 		langFilter, _ := cmd.Flags().GetString("lang")
@@ -48,11 +48,20 @@ Examples:
 		resolvedOnly, _ := cmd.Flags().GetBool("resolved")
 		unresolvedOnly, _ := cmd.Flags().GetBool("unresolved")
 
+		// Helper: per-name federation. Each requested symbol independently
+		// resolves to whichever DB owns it; downstream impls/implements stay
+		// within that DB (non-goal #1).
+		entryFor := func(name string) (string, string) {
+			entry, _ := findSymbolEntry(plan, name)
+			return entry.Path, entry.Label()
+		}
+
 		// --of is inherently singular; positional args are disallowed with it.
 		if inverse != "" {
 			if len(args) > 0 {
 				return fmt.Errorf("pass either positional symbols or --of <type>, not both")
 			}
+			dbPath, label := entryFor(inverse)
 			if graphRequested(cmd) {
 				results, err := fetchImpls(dbPath, inverse, inverse, 999999, langFilter, includes, excludes, resolvedOnly, unresolvedOnly)
 				if err != nil {
@@ -65,7 +74,7 @@ Examples:
 				graph = applyGraphLimit(graph, userLimit, format, graphRootIDSet("sym-root\x1f"+inverse))
 				return renderGraph(format, graph)
 			}
-			return runImplsOne(dbPath, inverse, inverse, jsonOut, limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly)
+			return runImplsOne(dbPath, inverse, inverse, jsonOut, limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly, label)
 		}
 
 		names, err := collectSymbols(cmd, args)
@@ -79,6 +88,7 @@ Examples:
 			var graphs []*index.GraphResult
 			var roots []string
 			for _, n := range names {
+				dbPath, _ := entryFor(n)
 				results, err := fetchImpls(dbPath, n, "", 999999, langFilter, includes, excludes, resolvedOnly, unresolvedOnly)
 				if err != nil {
 					return fmt.Errorf("graph %q: %w", n, err)
@@ -96,28 +106,32 @@ Examples:
 		if jsonOut && len(names) > 1 {
 			out := make(map[string]any, len(names))
 			for _, n := range names {
+				dbPath, label := entryFor(n)
 				rows, ferr := fetchImpls(dbPath, n, "", limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly)
 				if ferr != nil {
 					out[n] = map[string]any{"error": ferr.Error()}
 					continue
 				}
-				out[n] = map[string]any{
+				payload := map[string]any{
 					"symbol":            n,
 					"direction":         "implementors (incoming)",
 					"implementor_count": len(rows),
 					"results":           rows,
 				}
+				if label != "" {
+					payload["worktree"] = label
+				}
+				out[n] = payload
 			}
 			return writeJSON(out)
 		}
 
 		multi := len(names) > 1
 		for i, n := range names {
+			dbPath, label := entryFor(n)
 			if multi {
 				multiSymbolBanner(n, i == 0)
 				multiSymbolHeader(n)
-				// Keep "no implementors" on stdout so it stays in order with
-				// the header banners instead of interleaving with stderr.
 				rows, ferr := fetchImpls(dbPath, n, "", limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly)
 				if ferr != nil {
 					fmt.Printf("error: %v\n", ferr)
@@ -127,17 +141,18 @@ Examples:
 					fmt.Printf("No implementors found for '%s'.\n", n)
 					continue
 				}
-				_ = renderJSONOrFrontmatter(false, rows,
-					[]kv{
-						{"symbol", n},
-						{"direction", "implementors (incoming)"},
-						{"implementor_count", fmt.Sprintf("%d", len(rows))},
-					},
-					formatImplementorResults(rows, false),
-				)
+				meta := []kv{
+					{"symbol", n},
+					{"direction", "implementors (incoming)"},
+					{"implementor_count", fmt.Sprintf("%d", len(rows))},
+				}
+				if label != "" {
+					meta = append(meta, kv{"worktree", label})
+				}
+				_ = renderJSONOrFrontmatter(false, rows, meta, formatImplementorResults(rows, false))
 				continue
 			}
-			if err := runImplsOne(dbPath, n, "", jsonOut, limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly); err != nil {
+			if err := runImplsOne(dbPath, n, "", jsonOut, limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly, label); err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %v\n", n, err)
 				continue
 			}
@@ -191,7 +206,7 @@ func fetchImpls(dbPath, name, inverse string, limit int, langFilter string, incl
 }
 
 // runImplsOne renders a single-symbol impls result (either incoming or --of).
-func runImplsOne(dbPath, name, inverse string, jsonOut bool, limit int, langFilter string, includes, excludes []string, resolvedOnly, unresolvedOnly bool) error {
+func runImplsOne(dbPath, name, inverse string, jsonOut bool, limit int, langFilter string, includes, excludes []string, resolvedOnly, unresolvedOnly bool, worktreeLabel string) error {
 	results, err := fetchImpls(dbPath, name, inverse, limit, langFilter, includes, excludes, resolvedOnly, unresolvedOnly)
 	if err != nil {
 		return err
@@ -210,6 +225,9 @@ func runImplsOne(dbPath, name, inverse string, jsonOut bool, limit int, langFilt
 		meta = []kv{{"symbol", inverse}, {"direction", "implements (outgoing)"}, {"edges", fmt.Sprintf("%d", len(results))}}
 	} else {
 		meta = []kv{{"symbol", name}, {"direction", "implementors (incoming)"}, {"implementor_count", fmt.Sprintf("%d", len(results))}}
+	}
+	if worktreeLabel != "" {
+		meta = append(meta, kv{"worktree", worktreeLabel})
 	}
 	return renderJSONOrFrontmatter(
 		jsonOut,

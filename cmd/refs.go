@@ -25,8 +25,8 @@ Also accepts newline-separated names on stdin via --stdin:
 Note: references are best-effort based on AST name matching, not semantic analysis.`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		importers, _ := cmd.Flags().GetBool("importers")
 		impact, _ := cmd.Flags().GetBool("impact")
@@ -56,11 +56,14 @@ Note: references are best-effort based on AST name matching, not semantic analys
 			if i > 0 {
 				fmt.Println()
 			}
+			// Seed-only federation: route each name to whichever DB owns
+			// it; refs/importers stay within that DB (non-goal #1).
+			entry, _ := findSymbolEntry(plan, name)
 			var err error
 			if importers {
-				err = refsImporters(dbPath, name, depth, limit, jsonOut, includes, excludes)
+				err = refsImporters(entry.Path, name, depth, limit, jsonOut, includes, excludes, entry.Label())
 			} else {
-				err = refsSymbol(dbPath, name, limit, ctx, jsonOut, includes, excludes)
+				err = refsSymbol(entry.Path, name, limit, ctx, jsonOut, includes, excludes, entry.Label())
 			}
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
@@ -83,7 +86,7 @@ func init() {
 	rootCmd.AddCommand(refsCmd)
 }
 
-func refsSymbol(dbPath, name string, limit, ctx int, jsonOut bool, includes, excludes []string) error {
+func refsSymbol(dbPath, name string, limit, ctx int, jsonOut bool, includes, excludes []string, worktreeLabel string) error {
 	fetchLimit := widenPathFilterLimit(limit, len(includes) > 0 || len(excludes) > 0)
 	results, err := index.FindReferences(dbPath, name, fetchLimit)
 	if err != nil {
@@ -127,6 +130,9 @@ func refsSymbol(dbPath, name string, limit, ctx int, jsonOut bool, includes, exc
 	} else {
 		meta = append(meta, kv{"ref_count", fmt.Sprintf("%d", len(results))})
 	}
+	if worktreeLabel != "" {
+		meta = append(meta, kv{"worktree", worktreeLabel})
+	}
 	return renderJSONOrFrontmatter(
 		jsonOut,
 		enriched,
@@ -135,7 +141,7 @@ func refsSymbol(dbPath, name string, limit, ctx int, jsonOut bool, includes, exc
 	)
 }
 
-func refsImporters(dbPath, name string, depth, limit int, jsonOut bool, includes, excludes []string) error {
+func refsImporters(dbPath, name string, depth, limit int, jsonOut bool, includes, excludes []string, worktreeLabel string) error {
 	fetchLimit := widenPathFilterLimit(limit, len(includes) > 0 || len(excludes) > 0)
 	results, err := index.FindImporters(dbPath, name, depth, fetchLimit)
 	if err != nil {
@@ -151,13 +157,17 @@ func refsImporters(dbPath, name string, depth, limit int, jsonOut bool, includes
 		return nil
 	}
 
+	meta := []kv{
+		{"symbol", name},
+		{"importer_count", fmt.Sprintf("%d", len(results))},
+	}
+	if worktreeLabel != "" {
+		meta = append(meta, kv{"worktree", worktreeLabel})
+	}
 	return renderJSONOrFrontmatter(
 		jsonOut,
 		results,
-		[]kv{
-			{"symbol", name},
-			{"importer_count", fmt.Sprintf("%d", len(results))},
-		},
+		meta,
 		formatImporterResults(results),
 	)
 }

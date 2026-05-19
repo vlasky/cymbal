@@ -257,6 +257,21 @@ Each repo gets its own database under the OS cache directory:
 
 Override with `--db <path>` or `CYMBAL_DB` when needed.
 
+### Git Worktrees
+
+Cymbal stores one index per worktree by default. When you're inside a worktree
+that has siblings under the same `git common dir`, lookup commands
+(`search`, `show`, `investigate`, `impact`, `trace`, `impls`, `refs`)
+automatically federate across all indexed siblings. Results from non-current
+worktrees carry a `worktree:<name>` label so you can tell where each hit
+came from.
+
+Graph traversal (callers, impact, trace) stays within the worktree that owns
+the seed symbol — different branches have different code, so connecting them
+would produce wrong answers. Pass `--no-federate` to opt out, or set `--db`
+/ `CYMBAL_DB` to pin a single DB. Unindexed sibling worktrees are silently
+skipped — run `cymbal index .` inside any worktree you want included.
+
 Cymbal skips common generated and unusually large source files during indexing,
 including tree-sitter parser tables, protobuf outputs, minified JavaScript, and
 `generated/` / `__generated__/` subtrees. Use

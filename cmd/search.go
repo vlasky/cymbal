@@ -30,8 +30,8 @@ In symbol mode, pass multiple queries to search them independently. In text mode
 multiple query words are joined into one literal/regex pattern.`,
 	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		kind, _ := cmd.Flags().GetString("kind")
 		limit, _ := cmd.Flags().GetInt("limit")
@@ -58,16 +58,55 @@ multiple query words are joined into one literal/regex pattern.`,
 			if strings.TrimSpace(query) == "" {
 				return fmt.Errorf("no search query provided")
 			}
-			return searchText(dbPath, query, lang, limit, jsonOut, includes, excludes)
+			// Text mode stays single-DB: rg/grep already scans the current
+			// working tree; federating across worktrees would scan files we
+			// can't read from cwd. Worktree-text-search is a separate scope.
+			return searchText(plan.Primary, query, lang, limit, jsonOut, includes, excludes)
 		}
 
 		queries, err = collectSymbols(cmd, queries)
 		if err != nil {
 			return err
 		}
-		results, missing, err := searchSymbolQueries(dbPath, queries, kind, lang, effectiveExact, ignoreCase, limit, hasFilters, includes, excludes)
-		if err != nil {
-			return err
+		var (
+			results []index.SymbolResult
+			missing []string
+		)
+		// Federate symbol lookup across all entries in the plan. Current cwd
+		// queried first so its hits sort to the top. Per-DB missing lists
+		// merge into one "missing across all worktrees" set.
+		missingPerQuery := make(map[string]int)
+		for _, query := range queries {
+			missingPerQuery[query] = 0
+		}
+		for _, entry := range plan.Federated {
+			entryResults, entryMissing, err := searchSymbolQueries(entry.Path, queries, kind, lang, effectiveExact, ignoreCase, limit, hasFilters, includes, excludes)
+			if err != nil {
+				// One DB failing (e.g. corrupt sibling) shouldn't sink the
+				// whole query — log to stderr and move on.
+				if entry.IsCurrent {
+					return err
+				}
+				fmt.Fprintf(cmd.ErrOrStderr(), "cymbal: skipping worktree %s — query error: %v\n", entry.Label(), err)
+				continue
+			}
+			label := entry.Label()
+			if label != "" {
+				for i := range entryResults {
+					entryResults[i].Worktree = label
+				}
+			}
+			results = append(results, entryResults...)
+			for _, q := range entryMissing {
+				missingPerQuery[q]++
+			}
+		}
+		// A query is "missing" only when every federated DB missed it.
+		totalDBs := len(plan.Federated)
+		for _, query := range queries {
+			if missingPerQuery[query] == totalDBs {
+				missing = append(missing, query)
+			}
 		}
 		for _, query := range missing {
 			fmt.Fprintf(cmd.ErrOrStderr(), "%s: no results found\n", query)
@@ -83,7 +122,11 @@ multiple query words are joined into one literal/regex pattern.`,
 
 		var content strings.Builder
 		for _, r := range results {
-			fmt.Fprintf(&content, "%s %s %s:%d\n", r.Kind, r.Name, r.RelPath, r.StartLine)
+			if r.Worktree != "" {
+				fmt.Fprintf(&content, "[worktree:%s] %s %s %s:%d\n", r.Worktree, r.Kind, r.Name, r.RelPath, r.StartLine)
+			} else {
+				fmt.Fprintf(&content, "%s %s %s:%d\n", r.Kind, r.Name, r.RelPath, r.StartLine)
+			}
 		}
 
 		meta := []kv{{"query", query}}

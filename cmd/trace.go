@@ -34,8 +34,8 @@ Examples:
   cymbal outline svc.go -s --names | cymbal trace --stdin`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		depth, _ := cmd.Flags().GetInt("depth")
 		limit, _ := cmd.Flags().GetInt("limit")
@@ -55,10 +55,12 @@ Examples:
 		}
 
 		if graphRequested(cmd) {
-			return renderAsGraph(cmd, dbPath, names, index.GraphDirectionDown, 2)
+			entry, _ := findSymbolEntry(plan, names[0])
+			return renderAsGraph(cmd, entry.Path, names, index.GraphDirectionDown, 2)
 		}
 
-		merged, sourceMap, totalRaw, err := mergeTrace(dbPath, names, depth, limit, kinds)
+		merged, sourceMap, labelMap, totalRaw, err := mergeTracePlan(plan, names, depth, limit, kinds)
+		_ = labelMap
 		if err != nil {
 			return err
 		}
@@ -119,6 +121,9 @@ Examples:
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}
+		if wt := summarizeWorktreeLabels(names, labelMap); wt != "" {
+			meta = append(meta, kv{"worktree", wt})
+		}
 		frontmatter(meta, content.String())
 		return nil
 	},
@@ -130,18 +135,39 @@ func traceKey(r index.TraceResult) string {
 	return fmt.Sprintf("%s:%d|%s", r.File, r.Line, r.Callee)
 }
 
-// mergeTrace runs FindTrace for each requested symbol and dedupes by traceKey,
-// preserving first-seen order. sourceMap records which of the requested
-// symbols contributed each row; totalRaw is the pre-dedup count.
+// mergeTrace runs FindTrace against a single DB. Retained for back-compat
+// with single-DB callers (tests).
 func mergeTrace(dbPath string, names []string, depth, limit int, kinds []string) ([]index.TraceResult, map[string][]string, int, error) {
+	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, func(string) string { return dbPath })
+	return merged, source, raw, err
+}
+
+// mergeTracePlan is the federation-aware variant: each name routes to
+// whichever DB owns the seed; callees stay within that DB (non-goal #1).
+func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []string) ([]index.TraceResult, map[string][]string, map[string]string, int, error) {
+	resolve := func(name string) string {
+		entry, _ := findSymbolEntry(plan, name)
+		return entry.Path
+	}
+	labelMap := make(map[string]string, len(names))
+	for _, name := range names {
+		entry, _ := findSymbolEntry(plan, name)
+		labelMap[name] = entry.Label()
+	}
+	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, resolve)
+	return merged, source, labelMap, raw, err
+}
+
+func runMergeTrace(names []string, depth, limit int, kinds []string, dbForName func(string) string) ([]index.TraceResult, map[string][]string, map[string]int, int, error) {
 	var merged []index.TraceResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{}
 	totalRaw := 0
 	for _, name := range names {
+		dbPath := dbForName(name)
 		rows, err := index.FindTrace(dbPath, name, depth, limit, kinds...)
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, nil, nil, 0, err
 		}
 		totalRaw += len(rows)
 		for _, r := range rows {
@@ -168,7 +194,7 @@ func mergeTrace(dbPath string, names []string, depth, limit int, kinds []string)
 			}
 		}
 	}
-	return merged, sourceMap, totalRaw, nil
+	return merged, sourceMap, seen, totalRaw, nil
 }
 
 func init() {

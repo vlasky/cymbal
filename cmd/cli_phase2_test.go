@@ -211,7 +211,7 @@ func TestPhase2CommandOutputsForSymbolWorkflows(t *testing.T) {
 	requireOutputContains(t, stdout, "func Execute()")
 
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return refsSymbol(dbPath, "helper", 20, 0, false, nil, nil)
+		return refsSymbol(dbPath, "helper", 20, 0, false, nil, nil, "")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +236,7 @@ func TestPhase2CommandOutputsForSymbolWorkflows(t *testing.T) {
 	}
 
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return runImplsOne(dbPath, "Service", "", false, 20, "java", nil, nil, false, false)
+		return runImplsOne(dbPath, "Service", "", false, 20, "java", nil, nil, false, false, "")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -245,7 +245,7 @@ func TestPhase2CommandOutputsForSymbolWorkflows(t *testing.T) {
 	requireOutputContains(t, stdout, "UserService")
 
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return runImplsOne(dbPath, "UserService", "UserService", false, 20, "java", nil, nil, false, false)
+		return runImplsOne(dbPath, "UserService", "UserService", false, 20, "java", nil, nil, false, false, "")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -440,7 +440,7 @@ func TestPhase3CommandSearchShowInvestigateAndImporters(t *testing.T) {
 		t.Fatalf("expected fuzzy investigate for lowercase execute: %+v", investigated)
 	}
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return investigateOnePrint(dbPath, "Service", false)
+		return investigateOnePrint(dbPath, "Service", false, "")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -449,7 +449,7 @@ func TestPhase3CommandSearchShowInvestigateAndImporters(t *testing.T) {
 	requireOutputContains(t, stdout, "# Implementors")
 
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return refsImporters(dbPath, "Shared", 1, 20, false, nil, nil)
+		return refsImporters(dbPath, "Shared", 1, 20, false, nil, nil, "")
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -577,6 +577,11 @@ type SymbolResult struct {
 	Depth     int    `json:"depth"`
 	Signature string `json:"signature,omitempty"`
 	Language  string `json:"language"`
+	// Worktree labels results that came from a sibling worktree under the
+	// same git common dir. Empty (and omitted from JSON) for results from
+	// the current cwd's worktree, preserving byte-identical output for
+	// repos with no sibling worktrees.
+	Worktree string `json:"worktree,omitempty"`
 }
 
 // SymbolID returns a stable identifier for this symbol.

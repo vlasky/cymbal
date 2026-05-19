@@ -32,14 +32,18 @@ Examples:
   cymbal investigate Foo Bar Baz     # batch: investigate multiple symbols`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := getDBPath(cmd)
-		ensureFresh(dbPath)
+		plan := resolveDBs(cmd)
+		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 
 		if jsonOut && len(args) > 1 {
 			var all []any
 			for _, name := range args {
-				data := investigateOne(dbPath, name)
+				entry, _ := findSymbolEntry(plan, name)
+				data := investigateOne(entry.Path, name)
+				if label := entry.Label(); label != "" {
+					data["worktree"] = label
+				}
 				all = append(all, data)
 			}
 			return writeJSON(all)
@@ -49,7 +53,8 @@ Examples:
 			if i > 0 {
 				fmt.Println()
 			}
-			if err := investigateOnePrint(dbPath, name, jsonOut); err != nil {
+			entry, _ := findSymbolEntry(plan, name)
+			if err := investigateOnePrint(entry.Path, name, jsonOut, entry.Label()); err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
 			}
 		}
@@ -80,7 +85,7 @@ func investigateOne(dbPath, name string) map[string]any {
 	return data
 }
 
-func investigateOnePrint(dbPath, name string, jsonOut bool) error {
+func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string) error {
 	res, err := flexResolve(dbPath, name)
 	if err != nil {
 		return err
@@ -102,6 +107,9 @@ func investigateOnePrint(dbPath, name string, jsonOut bool) error {
 		}
 		if res.Fuzzy {
 			data["fuzzy"] = true
+		}
+		if worktreeLabel != "" {
+			data["worktree"] = worktreeLabel
 		}
 		return writeJSON(data)
 	}
@@ -189,6 +197,9 @@ func investigateOnePrint(dbPath, name string, jsonOut bool) error {
 		{"kind", sym.Kind},
 		{"investigate", result.Kind},
 		{"file", fmt.Sprintf("%s:%d", sym.RelPath, sym.StartLine)},
+	}
+	if worktreeLabel != "" {
+		meta = append(meta, kv{"worktree", worktreeLabel})
 	}
 	if res.TotalFound > 1 {
 		also := make([]string, 0, len(res.Results)-1)
