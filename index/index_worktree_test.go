@@ -1,6 +1,7 @@
 package index
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -118,7 +119,7 @@ func TestRepoCommonDirWorktreeMatchesMain(t *testing.T) {
 		}
 	}
 	run("init", "-q", "-b", "main")
-	if err := exec.Command("sh", "-c", "echo hi > "+filepath.Join(main, "a.txt")).Run(); err != nil {
+	if err := os.WriteFile(filepath.Join(main, "a.txt"), []byte("hi\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	run("add", ".")
@@ -154,7 +155,7 @@ func TestEnumerateWorktreesReturnsMainAndLinked(t *testing.T) {
 		}
 	}
 	run("init", "-q", "-b", "main")
-	if err := exec.Command("sh", "-c", "echo hi > "+filepath.Join(main, "a.txt")).Run(); err != nil {
+	if err := os.WriteFile(filepath.Join(main, "a.txt"), []byte("hi\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	run("add", ".")
