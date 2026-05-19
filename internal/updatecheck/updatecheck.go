@@ -107,7 +107,7 @@ func GetStatus(ctx context.Context, opts Options) (Status, error) {
 			status.Source = "cache"
 			return status, nil
 		}
-		if !opts.AllowNetwork || inFailureBackoff(state, nowFn()) {
+		if !opts.AllowNetwork || stuckInFailureBackoff(state, nowFn()) {
 			status.Source = "cache"
 			return status, nil
 		}
@@ -290,6 +290,28 @@ func inFailureBackoff(state cacheState, now time.Time) bool {
 		return false
 	}
 	return now.Sub(state.LastCheckFailedAt) < failedRetryTT
+}
+
+// stuckInFailureBackoff gates a live retry only while the cache is still
+// "close to fresh". Once cache age exceeds checkTTL + failedRetryTT (~30h),
+// we bypass the failure backoff so a multi-day-stale cache never blocks a
+// retry indefinitely — even when every preceding retry has failed and
+// pushed LastCheckFailedAt forward.
+//
+// Without this cap, a tight loop of:
+//
+//	stale cache → fetch fails → LastCheckFailedAt = now → backoff active
+//	→ next run returns stale cache → ... → forever
+//
+// would keep the user on whatever version they had at the time of the last
+// successful check (see issue #58).
+func stuckInFailureBackoff(state cacheState, now time.Time) bool {
+	if !inFailureBackoff(state, now) {
+		return false
+	}
+	// Cap honored only while cache age is within one failure-window beyond
+	// the staleness threshold.
+	return now.Sub(state.LastCheckedAt) < checkTTL+failedRetryTT
 }
 
 func loadState() (cacheState, error) {

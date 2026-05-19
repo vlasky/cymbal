@@ -247,6 +247,9 @@ func TestGetStatusFetchesLiveAndPreservesNotificationState(t *testing.T) {
 }
 
 func TestGetStatusUsesStaleCacheDuringFailureBackoff(t *testing.T) {
+	// Cache is stale but within the failure-backoff cap (25h < checkTTL +
+	// failedRetryTT = 30h), so a recent failure legitimately gates the retry
+	// to avoid thrashing GitHub during a transient outage.
 	reset := stubUpdateCheckEnv(t)
 	defer reset()
 
@@ -254,7 +257,7 @@ func TestGetStatusUsesStaleCacheDuringFailureBackoff(t *testing.T) {
 	nowFn = func() time.Time { return now }
 	if err := saveState(cacheState{
 		SchemaVersion:     schemaVersion,
-		LastCheckedAt:     now.Add(-48 * time.Hour),
+		LastCheckedAt:     now.Add(-25 * time.Hour),
 		LastCheckFailedAt: now.Add(-time.Hour),
 		LatestVersion:     "v0.12.0",
 		ReleaseURL:        releaseURL,
@@ -272,6 +275,113 @@ func TestGetStatusUsesStaleCacheDuringFailureBackoff(t *testing.T) {
 	}
 	if status.Source != "cache" || !status.CacheStale || !status.Available {
 		t.Fatalf("unexpected stale-cache status: %+v", status)
+	}
+}
+
+// TestGetStatusBypassesFailureBackoffForVeryStaleCache reproduces issue #58:
+// a cache that is far past the staleness threshold must trigger a live retry
+// even when LastCheckFailedAt is within the failure-backoff window.
+// Otherwise a tight failure loop keeps the user on whatever version they
+// had at the last successful fetch, indefinitely.
+func TestGetStatusBypassesFailureBackoffForVeryStaleCache(t *testing.T) {
+	reset := stubUpdateCheckEnv(t)
+	defer reset()
+
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	nowFn = func() time.Time { return now }
+	// The reporter's case: cache from 12 days ago, failure inside backoff.
+	if err := saveState(cacheState{
+		SchemaVersion:     schemaVersion,
+		LastCheckedAt:     now.Add(-12 * 24 * time.Hour),
+		LastCheckFailedAt: now.Add(-time.Hour),
+		LatestVersion:     "v0.13.1",
+		ReleaseURL:        releaseURL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetched := false
+	releaseFetch = func(ctx context.Context) (releaseInfo, error) {
+		fetched = true
+		return releaseInfo{Version: "v0.13.4", URL: releaseURL}, nil
+	}
+
+	status, err := GetStatus(context.Background(), Options{CurrentVersion: "v0.13.1", AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fetched {
+		t.Fatalf("very-stale cache must bypass failure backoff and attempt live fetch")
+	}
+	if status.Source != "live" {
+		t.Errorf("expected live source after bypass; got %q (status=%+v)", status.Source, status)
+	}
+	if status.LatestVersion != "v0.13.4" {
+		t.Errorf("expected refreshed latest version; got %q", status.LatestVersion)
+	}
+}
+
+// TestGetStatusBypassesFailureBackoffExactlyAtCap pins the boundary between
+// "honor backoff" and "bypass backoff". checkTTL + failedRetryTT = 30h.
+// At exactly 30h staleness with a 1h-old failure, the cap kicks in and we
+// attempt a live retry.
+func TestGetStatusBypassesFailureBackoffExactlyAtCap(t *testing.T) {
+	reset := stubUpdateCheckEnv(t)
+	defer reset()
+
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	nowFn = func() time.Time { return now }
+	if err := saveState(cacheState{
+		SchemaVersion:     schemaVersion,
+		LastCheckedAt:     now.Add(-(checkTTL + failedRetryTT)),
+		LastCheckFailedAt: now.Add(-time.Hour),
+		LatestVersion:     "v0.13.1",
+		ReleaseURL:        releaseURL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetched := false
+	releaseFetch = func(ctx context.Context) (releaseInfo, error) {
+		fetched = true
+		return releaseInfo{Version: "v0.13.4", URL: releaseURL}, nil
+	}
+	_, err := GetStatus(context.Background(), Options{CurrentVersion: "v0.13.1", AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fetched {
+		t.Fatalf("at the staleness cap, failure backoff must yield to a live retry")
+	}
+}
+
+// TestGetStatusHonorsFailureBackoffForFreshlyStaleCache verifies the other
+// side of the cap: cache stale by only a few minutes plus a 1h-old failure
+// keeps the backoff active. This prevents tight retries after a transient
+// outage when the cache is still close to fresh.
+func TestGetStatusHonorsFailureBackoffForFreshlyStaleCache(t *testing.T) {
+	reset := stubUpdateCheckEnv(t)
+	defer reset()
+
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	nowFn = func() time.Time { return now }
+	if err := saveState(cacheState{
+		SchemaVersion:     schemaVersion,
+		LastCheckedAt:     now.Add(-(checkTTL + 5*time.Minute)),
+		LastCheckFailedAt: now.Add(-time.Hour),
+		LatestVersion:     "v0.13.1",
+		ReleaseURL:        releaseURL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releaseFetch = func(ctx context.Context) (releaseInfo, error) {
+		t.Fatal("fresh stale + recent failure must keep the backoff active")
+		return releaseInfo{}, nil
+	}
+	status, err := GetStatus(context.Background(), Options{CurrentVersion: "v0.13.1", AllowNetwork: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Source != "cache" {
+		t.Errorf("expected cache source within backoff window; got %q", status.Source)
 	}
 }
 
