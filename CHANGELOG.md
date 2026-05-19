@@ -2,6 +2,14 @@
 
 All notable changes to cymbal are documented here.
 
+## [0.13.5] - 2026-05-19
+
+### Fixed
+
+- **`cymbal hook nudge` now fires on Claude Code's Grep, Glob, and Read tools** ([#47](https://github.com/1broseidon/cymbal/issues/47)) — the matcher previously only knew the Bash schema (`tool_input.command`), so Claude's dedicated code-search tools hit the hook and exited silently. The dispatcher now reads each tool's structured input (`pattern` + optional `glob`/`type` for Grep, `pattern` for Glob, `file_path` for Read) and emits a `cymbal search` / `cymbal ls` / `cymbal show` suggestion when the target is a code file. A non-code extension deny list (md, json, yaml, toml, log, csv, env, …) keeps the nudge quiet when the agent is reading data. All existing v0.13.3 / v0.13.4 gates (literal-text shape, regex signals, explicit file paths) still apply across every tool. Recommended `matcher` becomes `"Bash|Grep|Glob|Read"`.
+- **Update notifications now refresh after multi-day staleness** ([#58](https://github.com/1broseidon/cymbal/issues/58)) — `GetStatus` honored the 6h failure backoff even for caches that were days stale, so a single failed live fetch followed by repeated runs could pin the user on whichever version was cached at the last successful check — indefinitely. The failure backoff is now capped at `checkTTL + failedRetryTT` (~30h), past which a live retry is always attempted. Worst-case staleness is now bounded.
+- **Worktree integration tests now portable on Windows** — the `RepoCommonDir` / `EnumerateWorktrees` test fixtures created their seed file via `exec.Command("sh", "-c", ...)`, which silently failed on Windows runners and blocked the release pipeline for v0.13.3 and v0.13.4. Switched to `os.WriteFile`.
+
 ## [0.13.4] - 2026-05-19
 
 ### Added
