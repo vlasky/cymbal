@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/1broseidon/cymbal/internal/updatecheck"
+	"github.com/1broseidon/cymbal/lang"
 	"github.com/spf13/cobra"
 )
 
@@ -76,12 +77,12 @@ pipe nudge into their own policy layer.`,
 	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		format, _ := cmd.Flags().GetString("format")
-		fields, toolName, err := readNudgeInput(args)
+		in, err := readNudgeInput(args)
 		if err != nil {
 			return err
 		}
-		suggestion := detectSearchCommand(fields, toolName)
-		return emitNudge(cmd.OutOrStdout(), cmd.ErrOrStderr(), format, fields, suggestion)
+		suggestion := detectNudge(in)
+		return emitNudge(cmd.OutOrStdout(), cmd.ErrOrStderr(), format, in.fields, suggestion)
 	},
 }
 
@@ -191,6 +192,21 @@ type Suggestion struct {
 	Why string `json:"why,omitempty"`
 	// Tool is the detected outer tool (rg, grep, find, etc.), informational.
 	Tool string `json:"tool,omitempty"`
+}
+
+// nudgeInput holds everything readNudgeInput could extract from one hook
+// invocation. For the legacy Bash path, fields + toolName are populated and
+// the dedicated-tool fields are zero. For Claude Code's Grep/Glob/Read tools
+// the dedicated fields below are populated instead; fields stays empty.
+type nudgeInput struct {
+	toolName string
+	fields   []string
+
+	// Dedicated-tool fields (Claude Code Grep/Glob/Read).
+	pattern  string // Grep pattern, Glob pattern
+	glob     string // Grep --glob filter
+	fileType string // Grep --type filter
+	filePath string // Read file_path
 }
 
 // detectSearchCommand inspects an already-tokenized argv (first element is
@@ -416,6 +432,152 @@ func extractSearchQuery(args []string) string {
 	return ""
 }
 
+// detectNudge dispatches on tool name. Claude Code's dedicated Grep/Glob/Read
+// tools carry structured input, not a command string — those go through
+// per-tool detectors. Bash and any other shell tool fall through to
+// detectSearchCommand against the tokenized argv.
+//
+// Returns an empty Suggestion when nothing should fire — every detector
+// errs on the side of staying silent (see the design notes on
+// detectSearchCommand).
+func detectNudge(in nudgeInput) Suggestion {
+	switch in.toolName {
+	case "Grep":
+		return detectGrepToolSearch(in.pattern, in.glob, in.fileType)
+	case "Glob":
+		return detectGlobToolSearch(in.pattern)
+	case "Read":
+		return detectReadToolSearch(in.filePath)
+	}
+	return detectSearchCommand(in.fields, in.toolName)
+}
+
+// detectGrepToolSearch fires when Claude Code's Grep tool is called with a
+// symbol-shaped pattern against a code-file scope. The literal/regex gates
+// from detectSearchCommand still apply (multi-word phrases, embedded quotes,
+// `|` alternation, etc.); the only new responsibility here is recognising
+// that an explicit `glob`/`type` filter targeting non-code files (markdown,
+// JSON, logs, etc.) means the caller is reading data, not navigating code.
+func detectGrepToolSearch(pattern, glob, fileType string) Suggestion {
+	if pattern == "" || !looksLikeCodeQuery(pattern) {
+		return Suggestion{}
+	}
+	if glob != "" && !globTargetsCode(glob) {
+		return Suggestion{}
+	}
+	if fileType != "" && !rgTypeIsCode(fileType) {
+		return Suggestion{}
+	}
+	return Suggestion{
+		Tool:        "Grep",
+		Replacement: fmt.Sprintf("cymbal search %s", shQuoteIfNeeded(pattern)),
+		Why:         "Keep the Grep tool for literal text or regex across non-code files.",
+	}
+}
+
+// detectGlobToolSearch fires when the Glob tool's pattern targets code files.
+// The natural cymbal equivalent is `cymbal ls --names` (file inventory) or a
+// scoped `cymbal search --path <pattern> <symbol>` once a symbol is in hand —
+// the nudge points at the broader navigation surface rather than a single
+// command, since Glob alone doesn't carry symbol intent.
+func detectGlobToolSearch(pattern string) Suggestion {
+	if pattern == "" {
+		return Suggestion{}
+	}
+	if !globTargetsCode(pattern) {
+		return Suggestion{}
+	}
+	return Suggestion{
+		Tool:        "Glob",
+		Replacement: "cymbal ls --names",
+		Why:         "Keep the Glob tool for non-code file discovery; cymbal indexes code paths already.",
+	}
+}
+
+// detectReadToolSearch fires when Claude Code's Read tool targets a code
+// file. Reading a whole file when you only need a symbol is wasteful; the
+// nudge points at `cymbal show <file>` which supports line ranges and
+// symbol-targeted reads.
+func detectReadToolSearch(filePath string) Suggestion {
+	if filePath == "" {
+		return Suggestion{}
+	}
+	if !looksLikeCodeFile(filePath) {
+		return Suggestion{}
+	}
+	return Suggestion{
+		Tool:        "Read",
+		Replacement: fmt.Sprintf("cymbal show %s", shQuoteIfNeeded(filePath)),
+		Why:         "Use `cymbal show <file>:Symbol` or `<file>:L1-L2` when you want a specific symbol or line range.",
+	}
+}
+
+// nonCodeExtensions enumerates file extensions cymbal explicitly does not
+// want to nudge for, even when cymbal indexes them as a language (yaml,
+// json, etc. are indexed but agents grep them as data, not as code).
+//
+// Source: issue #47's suggested skip list, plus a few common siblings.
+var nonCodeExtensions = map[string]bool{
+	".md": true, ".markdown": true, ".rst": true, ".adoc": true,
+	".json": true, ".jsonl": true, ".jsonc": true, ".json5": true,
+	".yaml": true, ".yml": true, ".toml": true,
+	".log": true, ".ndjson": true,
+	".txt": true, ".csv": true, ".tsv": true, ".xml": true, ".html": true,
+	".ini": true, ".conf": true, ".env": true, ".lock": true, ".properties": true,
+}
+
+// looksLikeCodeFile is the "should the nudge fire?" test for a filename.
+// Returns false when the extension is on our explicit non-code list, OR
+// when the language registry doesn't recognise the file at all. Returns
+// true when cymbal knows about the file and it isn't on the deny list —
+// the agent is reading code we could navigate symbolically.
+func looksLikeCodeFile(name string) bool {
+	if name == "" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext != "" && nonCodeExtensions[ext] {
+		return false
+	}
+	return lang.Default.ForFile(name) != nil
+}
+
+// globTargetsCode reports whether a glob unambiguously targets non-code
+// files. Returns false only when we can isolate a single extension and
+// that extension is on the non-code list; everything else returns true so
+// the existing literal/regex gates can decide.
+func globTargetsCode(glob string) bool {
+	if glob == "" {
+		return true
+	}
+	// Brace expansion → can't trivially isolate; assume code.
+	if strings.ContainsAny(glob, "{}") {
+		return true
+	}
+	g := glob
+	if idx := strings.LastIndex(g, "/"); idx >= 0 {
+		g = g[idx+1:]
+	}
+	g = strings.TrimLeft(g, "*?")
+	if !strings.HasPrefix(g, ".") {
+		return true
+	}
+	return !nonCodeExtensions[strings.ToLower(g)]
+}
+
+// rgTypeIsCode classifies ripgrep --type names against the same non-code
+// set as the extension check, so `Grep --type yaml` and `Grep --glob '*.yaml'`
+// are treated identically.
+func rgTypeIsCode(t string) bool {
+	t = strings.ToLower(t)
+	switch t {
+	case "md", "markdown", "json", "jsonl", "yaml", "yml", "toml",
+		"log", "txt", "csv", "tsv", "xml", "ini", "env", "lock":
+		return false
+	}
+	return true
+}
+
 // extractFindNameArg handles `find DIR -name PATTERN`, `-iname PATTERN`,
 // `-path PATTERN`. Returns PATTERN if present.
 func extractFindNameArg(args []string) string {
@@ -436,20 +598,20 @@ func extractFindNameArg(args []string) string {
 //   - at least 3 chars
 //   - not a pure wildcard or a pure regex metachar blob
 func looksLikeCodeQuery(q string) bool {
-	q = strings.Trim(q, `'"`)
+	// Inspect the raw value for quote characters first — any embedded
+	// quote signals literal-text intent (`"jsx"`, `'foo'`), regardless
+	// of whether the surrounding shell parsing already trimmed an outer
+	// pair. This catches Grep-tool patterns like `"jsx"` where there's
+	// no sibling file-path arg to rescue us.
+	if strings.ContainsAny(q, `"'`) {
+		return false
+	}
 	q = strings.TrimSpace(q)
 	if len(q) < 3 {
 		return false
 	}
 	// Reject obvious binary/text-file globs like "*.log", "*.md".
 	if strings.HasPrefix(q, "*.") {
-		return false
-	}
-	// Literal-text signals: if outer quotes were trimmed but inner quote
-	// chars survive, the user is searching for a string value (`"jsx"`,
-	// `'foo'`), not a symbol name. Same for whitespace — multi-word
-	// queries are phrases, not identifiers.
-	if strings.ContainsAny(q, `"'`) {
 		return false
 	}
 	if strings.ContainsAny(q, " \t\n") {
@@ -527,38 +689,59 @@ func shQuoteIfNeeded(s string) string {
 //     truncated at unquoted pipes, but that matches real shell behavior
 //     — if an agent runs `rg foo|bar` literally, it really did just run
 //     two commands, and we should only inspect the first.
-func readNudgeInput(args []string) (fields []string, toolName string, err error) {
+func readNudgeInput(args []string) (nudgeInput, error) {
 	if len(args) > 0 {
-		return args, "", nil
+		return nudgeInput{fields: args}, nil
 	}
 	// Avoid blocking on stdin when there's nothing to read (e.g. TTY).
 	stat, serr := os.Stdin.Stat()
 	if serr != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
-		return nil, "", nil
+		return nudgeInput{}, nil
 	}
 	data, rerr := io.ReadAll(os.Stdin)
 	if rerr != nil {
-		return nil, "", fmt.Errorf("reading stdin: %w", rerr)
+		return nudgeInput{}, fmt.Errorf("reading stdin: %w", rerr)
 	}
 	text := strings.TrimSpace(string(data))
 	if text == "" {
-		return nil, "", nil
+		return nudgeInput{}, nil
 	}
-	// Try Claude Code's PreToolUse shape first.
+	// Try Claude Code's PreToolUse shape first. We capture every field any
+	// of the dedicated tools could emit — unused fields stay zero.
 	if text[0] == '{' {
 		var payload struct {
 			ToolName  string `json:"tool_name"`
 			ToolInput struct {
-				Command string `json:"command"`
+				Command  string `json:"command"`
+				Pattern  string `json:"pattern"`
+				Glob     string `json:"glob"`
+				Type     string `json:"type"`
+				FilePath string `json:"file_path"`
 			} `json:"tool_input"`
 		}
 		if jerr := json.Unmarshal([]byte(text), &payload); jerr == nil {
+			in := nudgeInput{toolName: payload.ToolName}
+			switch payload.ToolName {
+			case "Grep":
+				in.pattern = payload.ToolInput.Pattern
+				in.glob = payload.ToolInput.Glob
+				in.fileType = payload.ToolInput.Type
+				return in, nil
+			case "Glob":
+				in.pattern = payload.ToolInput.Pattern
+				return in, nil
+			case "Read":
+				in.filePath = payload.ToolInput.FilePath
+				return in, nil
+			}
+			// Bash/shell or unknown tool: tokenize the command.
 			if payload.ToolInput.Command != "" || payload.ToolName != "" {
-				return splitShellish(payload.ToolInput.Command), payload.ToolName, nil
+				in.fields = splitShellish(payload.ToolInput.Command)
+				return in, nil
 			}
 		}
 	}
-	return splitShellish(text), "", nil
+	return nudgeInput{fields: splitShellish(text)}, nil
 }
 
 // ── nudge: output ─────────────────────────────────────────────────

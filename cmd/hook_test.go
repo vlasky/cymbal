@@ -203,6 +203,163 @@ func TestDetectMinusEPatternIsNotMistakenForFilePath(t *testing.T) {
 	}
 }
 
+// ── nudge: Claude Code dedicated tools (Grep / Glob / Read) ──
+// Issue #47: the matcher previously only knew the Bash schema; Grep/Glob/Read
+// hit the hook with structured tool_input fields and went silent. These tests
+// pin the new dispatch + the non-code-file skip behavior.
+
+func TestDetectGrepToolSymbolPattern(t *testing.T) {
+	s := detectNudge(nudgeInput{toolName: "Grep", pattern: "HandleRegister"})
+	if s.Replacement == "" {
+		t.Fatalf("Grep with symbol-shaped pattern should nudge; got %+v", s)
+	}
+	if s.Tool != "Grep" {
+		t.Errorf("expected Tool=Grep; got %q", s.Tool)
+	}
+	if !strings.Contains(s.Replacement, "cymbal search HandleRegister") {
+		t.Errorf("expected cymbal search suggestion; got %q", s.Replacement)
+	}
+}
+
+func TestDetectGrepToolNonCodeGlobSkipped(t *testing.T) {
+	// Reporter's case: `Grep --glob '*.json' Foo` is searching data, not code.
+	cases := []struct{ glob string }{
+		{"*.json"}, {"*.md"}, {"*.log"}, {"*.yaml"}, {"*.txt"},
+		{"**/*.jsonl"}, {"src/**/*.md"},
+	}
+	for _, tc := range cases {
+		s := detectNudge(nudgeInput{toolName: "Grep", pattern: "Foo", glob: tc.glob})
+		if s.Replacement != "" {
+			t.Errorf("non-code glob %q must suppress nudge; got %q", tc.glob, s.Replacement)
+		}
+	}
+}
+
+func TestDetectGrepToolNonCodeTypeSkipped(t *testing.T) {
+	for _, tt := range []string{"md", "json", "yaml", "log", "csv"} {
+		s := detectNudge(nudgeInput{toolName: "Grep", pattern: "Foo", fileType: tt})
+		if s.Replacement != "" {
+			t.Errorf("non-code --type %q must suppress nudge; got %q", tt, s.Replacement)
+		}
+	}
+}
+
+func TestDetectGrepToolCodeGlobNudges(t *testing.T) {
+	// A code-extension glob (the agent restricting to .go/.ts files) keeps
+	// the nudge active — that's exactly when we want it most.
+	for _, glob := range []string{"*.go", "**/*.ts", "src/**/*.tsx", "*.py", "*.rs"} {
+		s := detectNudge(nudgeInput{toolName: "Grep", pattern: "Handler", glob: glob})
+		if s.Replacement == "" {
+			t.Errorf("code glob %q should keep nudge active; got nothing", glob)
+		}
+	}
+}
+
+func TestDetectGrepToolLiteralPatternStillSkipped(t *testing.T) {
+	// The existing literal-text gates still apply: Grep with a quoted-value
+	// or multi-word pattern must skip even when the file scope is code.
+	cases := []nudgeInput{
+		{toolName: "Grep", pattern: `"jsx"`, glob: "*.go"},
+		{toolName: "Grep", pattern: "hello world", glob: "*.go"},
+		{toolName: "Grep", pattern: "foo|bar", glob: "*.go"},
+		{toolName: "Grep", pattern: "^Server$"},
+	}
+	for _, in := range cases {
+		if s := detectNudge(in); s.Replacement != "" {
+			t.Errorf("literal/regex pattern %q must skip; got %q", in.pattern, s.Replacement)
+		}
+	}
+}
+
+func TestDetectGlobToolCodePattern(t *testing.T) {
+	s := detectNudge(nudgeInput{toolName: "Glob", pattern: "**/*.go"})
+	if s.Replacement == "" {
+		t.Fatalf("Glob on code files should nudge; got %+v", s)
+	}
+	if s.Tool != "Glob" {
+		t.Errorf("expected Tool=Glob; got %q", s.Tool)
+	}
+}
+
+func TestDetectGlobToolNonCodePatternSkipped(t *testing.T) {
+	for _, pat := range []string{"*.json", "**/*.md", "logs/*.log", "*.yaml"} {
+		if s := detectNudge(nudgeInput{toolName: "Glob", pattern: pat}); s.Replacement != "" {
+			t.Errorf("non-code Glob %q must skip; got %q", pat, s.Replacement)
+		}
+	}
+}
+
+func TestDetectReadToolCodeFile(t *testing.T) {
+	s := detectNudge(nudgeInput{toolName: "Read", filePath: "/repo/src/handler.go"})
+	if s.Replacement == "" {
+		t.Fatalf("Read on a code file should nudge with cymbal show; got %+v", s)
+	}
+	if !strings.Contains(s.Replacement, "cymbal show") {
+		t.Errorf("expected cymbal show in suggestion; got %q", s.Replacement)
+	}
+}
+
+func TestDetectReadToolNonCodeFileSkipped(t *testing.T) {
+	for _, p := range []string{"README.md", "package.json", "config.yaml", "/tmp/output.log", "notes.txt"} {
+		if s := detectNudge(nudgeInput{toolName: "Read", filePath: p}); s.Replacement != "" {
+			t.Errorf("Read of non-code file %q must skip; got %q", p, s.Replacement)
+		}
+	}
+}
+
+func TestDetectBashFallsThroughToShellDetector(t *testing.T) {
+	// Bash tool still routes to the legacy shell detector — regression guard
+	// for everything shipped in #45 (literal-text/path-target/regex gates).
+	s := detectNudge(nudgeInput{toolName: "Bash", fields: []string{"rg", "FindUser", "."}})
+	if s.Replacement == "" {
+		t.Fatalf("Bash with rg discovery should nudge; got %+v", s)
+	}
+}
+
+func TestReadNudgeInputParsesGrepToolPayload(t *testing.T) {
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	_, _ = stdinW.WriteString(`{"tool_name":"Grep","tool_input":{"pattern":"WidgetService","path":"/repo","glob":"*.go"}}`)
+	_ = stdinW.Close()
+	in, err := readNudgeInput(nil)
+	os.Stdin = origStdin
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.toolName != "Grep" {
+		t.Errorf("expected toolName=Grep; got %q", in.toolName)
+	}
+	if in.pattern != "WidgetService" {
+		t.Errorf("expected pattern=WidgetService; got %q", in.pattern)
+	}
+	if in.glob != "*.go" {
+		t.Errorf("expected glob=*.go; got %q", in.glob)
+	}
+}
+
+func TestReadNudgeInputParsesReadToolPayload(t *testing.T) {
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	_, _ = stdinW.WriteString(`{"tool_name":"Read","tool_input":{"file_path":"/repo/src/main.go"}}`)
+	_ = stdinW.Close()
+	in, err := readNudgeInput(nil)
+	os.Stdin = origStdin
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.toolName != "Read" || in.filePath != "/repo/src/main.go" {
+		t.Errorf("Read payload not parsed correctly: %+v", in)
+	}
+}
+
 // ── nudge output shape ──
 
 func TestEmitNudgeClaudeCodeJSON(t *testing.T) {

@@ -595,13 +595,13 @@ func TestPhase3HookInstallAndNudgeInputRegressions(t *testing.T) {
 	os.Stdin = stdinR
 	_, _ = stdinW.WriteString(`{"tool_name":"Bash","tool_input":{"command":"rg 'func Execute' cmd"}}`)
 	_ = stdinW.Close()
-	fields, toolName, err := readNudgeInput(nil)
+	in, err := readNudgeInput(nil)
 	os.Stdin = origStdin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if toolName != "Bash" || strings.Join(fields, " ") != "rg func Execute cmd" {
-		t.Fatalf("readNudgeInput JSON = fields=%q tool=%q", fields, toolName)
+	if in.toolName != "Bash" || strings.Join(in.fields, " ") != "rg func Execute cmd" {
+		t.Fatalf("readNudgeInput JSON = fields=%q tool=%q", in.fields, in.toolName)
 	}
 	if got := shQuoteIfNeeded("has space"); got != "'has space'" {
 		t.Fatalf("shQuoteIfNeeded = %q", got)
