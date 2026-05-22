@@ -122,7 +122,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 
 	builder := newGraphBuilder(q, metas)
 	if graphDirectionIncludesDown(q.Direction) {
-		rows, err := s.FindTrace(q.Symbol, q.Depth, 1000)
+		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{IncludeUnresolved: q.IncludeUnresolved})
 		if err != nil {
 			return nil, err
 		}

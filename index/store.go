@@ -1512,6 +1512,11 @@ type TraceResult struct {
 	Depth   int    `json:"depth"`    // hop distance from root
 }
 
+// TraceOptions controls FindTrace behavior beyond the positional arguments.
+type TraceOptions struct {
+	IncludeUnresolved bool // include callees that don't resolve to any indexed symbol
+}
+
 // FindTrace performs downward call graph traversal using BFS.
 // Starting from a symbol, it finds what that symbol calls, then what those call, etc.
 //
@@ -1520,6 +1525,11 @@ type TraceResult struct {
 // Pass a broader set (e.g. {"call","use"}) to include type mentions and
 // other non-call identifier references.
 func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) ([]TraceResult, error) {
+	return s.FindTraceWithOptions(symbolName, depth, limit, TraceOptions{}, kinds...)
+}
+
+// FindTraceWithOptions is FindTrace with explicit control over filtering behavior.
+func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
 	if depth <= 0 {
 		depth = 3
 	}
@@ -1589,32 +1599,6 @@ func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) 
 		return results
 	}
 
-	// Filter out builtins and stdlib noise — keep only project-defined symbols.
-	isProjectSymbol := func(name string) bool {
-		// Skip Go builtins, common stdlib methods, and type casts.
-		switch name {
-		case "len", "cap", "make", "append", "close", "delete", "copy", "new", "panic", "recover",
-			"int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64",
-			"float32", "float64", "string", "bool", "byte", "rune", "error", "nil",
-			"Errorf", "Sprintf", "Fprintf", "Printf", "Println",
-			"Error", "String", "Close", "Read", "Write",
-			"Lock", "Unlock", "RLock", "RUnlock",
-			"Add", "Load", "Store", "Done", "Wait",
-			"Begin", "Commit", "Rollback", "Exec", "Query", "QueryRow", "Scan",
-			"Now", "Since", "Sleep",
-			"Join", "Split", "Contains", "HasPrefix", "HasSuffix", "TrimPrefix", "TrimSuffix",
-			"Open", "Create", "Remove", "Stat", "Lstat", "ReadFile", "WriteFile",
-			"Abs", "Dir", "Base", "Ext", "Rel",
-			"Go", "Next", "Rows":
-			return false
-		}
-		// Skip single-letter or very short names (usually loop vars or generics).
-		if len(name) <= 2 {
-			return false
-		}
-		return true
-	}
-
 	seen := make(map[string]bool)
 	var results []TraceResult
 	currentLocs := resolveSymbol(symbolName)
@@ -1624,20 +1608,30 @@ func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) 
 		for _, loc := range currentLocs {
 			callees := calleesOf(loc)
 			for _, tr := range callees {
-				if tr.Callee == loc.name || !isProjectSymbol(tr.Callee) {
+				if tr.Callee == loc.name {
+					continue
+				}
+				// Skip very short names (loop vars, single-char generics).
+				if len(tr.Callee) <= 2 {
 					continue
 				}
 				key := loc.name + "→" + tr.Callee
 				if seen[key] {
 					continue
 				}
-				seen[key] = true
 
+				// Resolve the callee — if it doesn't exist in the index,
+				// it's external (stdlib, third-party, or builtin).
+				nextSymLocs := resolveSymbol(tr.Callee)
+				if len(nextSymLocs) == 0 && !opts.IncludeUnresolved {
+					continue
+				}
+
+				seen[key] = true
 				tr.Depth = d
 				results = append(results, tr)
 
-				// Resolve the callee for the next depth level.
-				for _, nextLoc := range resolveSymbol(tr.Callee) {
+				for _, nextLoc := range nextSymLocs {
 					nextLocs = append(nextLocs, nextLoc)
 				}
 

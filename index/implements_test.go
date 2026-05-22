@@ -247,6 +247,8 @@ func TestFindTraceDefaultFiltersToCallKind(t *testing.T) {
 	}
 	if err := store.InsertSymbols(fid, []symbols.Symbol{
 		{Name: "load", Kind: "function", File: "/repo/a.swift", StartLine: 1, EndLine: 10, Language: "swift"},
+		{Name: "fetch", Kind: "function", File: "/repo/a.swift", StartLine: 12, EndLine: 20, Language: "swift"},
+		{Name: "UUID", Kind: "type", File: "/repo/a.swift", StartLine: 22, EndLine: 25, Language: "swift"},
 	}); err != nil {
 		t.Fatal(err)
 	}

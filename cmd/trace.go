@@ -41,6 +41,7 @@ Examples:
 		limit, _ := cmd.Flags().GetInt("limit")
 		kindsRaw, _ := cmd.Flags().GetString("kinds")
 		kinds := parseKindsFlag(kindsRaw)
+		includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
 
 		// Strip file-hint prefixes ("pkg/file.go:Sym" -> "Sym"); trace resolves
 		// by name internally so the hint is informational.
@@ -59,7 +60,8 @@ Examples:
 			return renderAsGraph(cmd, entry.Path, names, index.GraphDirectionDown, 2)
 		}
 
-		merged, sourceMap, labelMap, totalRaw, err := mergeTracePlan(plan, names, depth, limit, kinds)
+		opts := index.TraceOptions{IncludeUnresolved: includeUnresolved}
+		merged, sourceMap, labelMap, totalRaw, err := mergeTracePlan(plan, names, depth, limit, kinds, opts)
 		_ = labelMap
 		if err != nil {
 			return err
@@ -138,13 +140,13 @@ func traceKey(r index.TraceResult) string {
 // mergeTrace runs FindTrace against a single DB. Retained for back-compat
 // with single-DB callers (tests).
 func mergeTrace(dbPath string, names []string, depth, limit int, kinds []string) ([]index.TraceResult, map[string][]string, int, error) {
-	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, func(string) string { return dbPath })
+	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, index.TraceOptions{}, func(string) string { return dbPath })
 	return merged, source, raw, err
 }
 
 // mergeTracePlan is the federation-aware variant: each name routes to
 // whichever DB owns the seed; callees stay within that DB (non-goal #1).
-func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []string) ([]index.TraceResult, map[string][]string, map[string]string, int, error) {
+func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []string, opts index.TraceOptions) ([]index.TraceResult, map[string][]string, map[string]string, int, error) {
 	resolve := func(name string) string {
 		entry, _ := findSymbolEntry(plan, name)
 		return entry.Path
@@ -154,18 +156,18 @@ func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []strin
 		entry, _ := findSymbolEntry(plan, name)
 		labelMap[name] = entry.Label()
 	}
-	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, resolve)
+	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, opts, resolve)
 	return merged, source, labelMap, raw, err
 }
 
-func runMergeTrace(names []string, depth, limit int, kinds []string, dbForName func(string) string) ([]index.TraceResult, map[string][]string, map[string]int, int, error) {
+func runMergeTrace(names []string, depth, limit int, kinds []string, opts index.TraceOptions, dbForName func(string) string) ([]index.TraceResult, map[string][]string, map[string]int, int, error) {
 	var merged []index.TraceResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{}
 	totalRaw := 0
 	for _, name := range names {
 		dbPath := dbForName(name)
-		rows, err := index.FindTrace(dbPath, name, depth, limit, kinds...)
+		rows, err := index.FindTraceWithOptions(dbPath, name, depth, limit, opts, kinds...)
 		if err != nil {
 			return nil, nil, nil, 0, err
 		}
