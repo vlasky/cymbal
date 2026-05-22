@@ -1136,6 +1136,11 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 // FindTrace performs downward call graph traversal for a symbol.
 // kinds filters which ref kinds count as edges (default: {"call"}).
 func FindTrace(dbPath, symbolName string, depth, limit int, kinds ...string) ([]TraceResult, error) {
+	return FindTraceWithOptions(dbPath, symbolName, depth, limit, TraceOptions{}, kinds...)
+}
+
+// FindTraceWithOptions is FindTrace with explicit control over filtering.
+func FindTraceWithOptions(dbPath, symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -1143,7 +1148,7 @@ func FindTrace(dbPath, symbolName string, depth, limit int, kinds ...string) ([]
 	if err != nil {
 		return nil, err
 	}
-	return store.FindTrace(symbolName, depth, limit, kinds...)
+	return store.FindTraceWithOptions(symbolName, depth, limit, opts, kinds...)
 }
 
 // BuildGraph renders symbol relationships as a graph from an opened DB.
