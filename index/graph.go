@@ -452,11 +452,16 @@ func truncateByDegree(g *GraphResult, limit int, rootID string) *GraphResult {
 }
 
 func (s *Store) symbolMetas() (map[string][]graphSymbolMeta, error) {
+	// All depths, not just top-level: methods and other nested symbols are
+	// legitimate call-graph nodes, and trace/impact resolve against every
+	// depth — restricting metadata to depth 0 made the graph mislabel real
+	// nested methods as external. Deterministic ordering keeps the name-only
+	// metas[0] fallback stable (top-level first, then language/path/line).
 	rows, err := s.db.Query(`
 		SELECT s.name, f.rel_path, s.language
 		FROM symbols s
 		JOIN files f ON s.file_id = f.id
-		WHERE s.depth = 0
+		ORDER BY s.depth, s.language, f.rel_path, s.start_line
 	`)
 	if err != nil {
 		return nil, err
