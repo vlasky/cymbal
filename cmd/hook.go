@@ -797,7 +797,7 @@ func emitNudge(stdout, stderr io.Writer, format string, fields []string, s Sugge
 
 // reminderText is the short, tone-calibrated system block we ask agents
 // to treat as persistent context. Short by design.
-const reminderText = `This project is indexed by cymbal. Treat cymbal as the default code-navigation interface.
+const reminderText = `This project is indexed by cymbal. Use cymbal for structural code navigation when you know (or can guess) the symbol name.
 
 Default workflow:
   1. ` + "`cymbal search <name>`" + ` to locate a symbol or file by name.
@@ -808,7 +808,9 @@ Batch related lookups in one call when possible: ` + "`cymbal search Foo Bar`" +
 
 Prefer ` + "`cymbal search`" + ` over the Grep tool (or rg/grep) for symbol/function/class lookup. Prefer ` + "`cymbal show`" + ` over Read when reading source by symbol name. Prefer ` + "`cymbal investigate / impact / trace / impls`" + ` over manual cross-referencing.
 
-Use ` + "`cymbal search --text <pattern>`" + ` only for literal text or regex. Use Grep/Glob/Read (or rg/grep/find) for: literal text in non-code files (markdown, JSON, logs, config), files outside the indexed repo, and direct path reads when you already know the path.`
+Use ` + "`cymbal search --text <pattern>`" + ` only for literal text or regex. Use Grep/Glob/Read (or rg/grep/find) for: literal text in non-code files (markdown, JSON, logs, config), files outside the indexed repo, and direct path reads when you already know the path.
+
+Cymbal is for structural queries (known names, call graphs, references). For semantic/conceptual queries ("find code related to X") where you don't know the exact symbol name, prefer a semantic search tool if one is configured.`
 
 const (
 	remindUpdateCache   = "cache"
