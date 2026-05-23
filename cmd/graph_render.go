@@ -468,6 +468,17 @@ func renderGraph(format index.GraphFormat, graph *index.GraphResult) error {
 	}
 }
 
+// graphNodeLabel is the display label for a node: the symbol name, plus a
+// "(N defs)" cue when the name is ambiguous (collapses multiple definitions),
+// so the conflation is visible in mermaid/dot. Paths stay out of the visual
+// label — they're in the JSON definitions list.
+func graphNodeLabel(node index.GraphNode) string {
+	if node.DefinitionCount > 1 {
+		return fmt.Sprintf("%s (%d defs)", node.Label, node.DefinitionCount)
+	}
+	return node.Label
+}
+
 func renderGraphMermaid(graph *index.GraphResult) string {
 	if len(graph.Nodes) == 0 && len(graph.Edges) == 0 {
 		return "flowchart LR\n%% no edges\n"
@@ -475,7 +486,7 @@ func renderGraphMermaid(graph *index.GraphResult) string {
 	var b strings.Builder
 	b.WriteString("flowchart LR\n")
 	for _, node := range graph.Nodes {
-		fmt.Fprintf(&b, "  %s[%q]\n", node.ID, node.Label)
+		fmt.Fprintf(&b, "  %s[%q]\n", node.ID, graphNodeLabel(node))
 	}
 	for _, edge := range graph.Edges {
 		arrow := "-->"
@@ -494,7 +505,7 @@ func renderGraphDOT(graph *index.GraphResult) string {
 	var b strings.Builder
 	b.WriteString("digraph cymbal {\n")
 	for _, node := range graph.Nodes {
-		fmt.Fprintf(&b, "  %s [label=%q];\n", node.ID, node.Label)
+		fmt.Fprintf(&b, "  %s [label=%q];\n", node.ID, graphNodeLabel(node))
 	}
 	for _, edge := range graph.Edges {
 		attrs := ""

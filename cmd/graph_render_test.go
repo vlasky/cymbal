@@ -209,3 +209,21 @@ func captureStdout(t *testing.T, fn func()) string {
 	_ = w.Close()
 	return <-outC
 }
+
+func TestRenderGraphMermaidShowsAmbiguityCue(t *testing.T) {
+	g := &index.GraphResult{
+		Nodes: []index.GraphNode{
+			{ID: "n1", Kind: index.GraphNodeKindSymbol, Label: "Root", Symbol: "Root"},
+			{ID: "n2", Kind: index.GraphNodeKindSymbol, Label: "Dup", Symbol: "Dup", DefinitionCount: 2,
+				Definitions: []index.GraphDefinition{{Path: "a.go", Language: "go", StartLine: 6}, {Path: "b.go", Language: "go", StartLine: 3}}},
+		},
+		Edges: []index.GraphEdge{{From: "n1", To: "n2", Kind: index.GraphEdgeKindCall, Resolved: true}},
+	}
+	out := renderGraphMermaid(g)
+	if !strings.Contains(out, `"Dup (2 defs)"`) {
+		t.Fatalf("expected ambiguity cue 'Dup (2 defs)' in mermaid, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"Root"`) {
+		t.Fatalf("expected unannotated Root label, got:\n%s", out)
+	}
+}

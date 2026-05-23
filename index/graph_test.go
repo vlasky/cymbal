@@ -362,3 +362,64 @@ func TestBuildGraphImpactPreservesNestedCaller(t *testing.T) {
 		t.Fatalf("expected impact edge handle->save (nested caller preserved), got %+v", g.Edges)
 	}
 }
+
+// TestBuildGraphAnnotatesAmbiguousNode verifies that a name with more than one
+// indexed definition produces a single (name-only) node annotated with the
+// definition count and locations, while an unambiguous name carries neither.
+func TestBuildGraphAnnotatesAmbiguousNode(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	aID, _ := store.UpsertFile("/repo/a.go", "a.go", "go", "h1", now, 100)
+	bID, _ := store.UpsertFile("/repo/b.go", "b.go", "go", "h2", now, 100)
+	if err := store.InsertSymbols(aID, []symbols.Symbol{
+		{Name: "Root", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 5, Language: "go"},
+		{Name: "Dup", Kind: "function", File: "/repo/a.go", StartLine: 6, EndLine: 8, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertSymbols(bID, []symbols.Symbol{
+		{Name: "Dup", Kind: "function", File: "/repo/b.go", StartLine: 3, EndLine: 5, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(aID, []symbols.Ref{
+		{Name: "Dup", Line: 2, Language: "go", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := store.BuildGraph(GraphQuery{Symbol: "Root", Direction: GraphDirectionDown, Depth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dup, root *GraphNode
+	for i := range g.Nodes {
+		switch g.Nodes[i].Symbol {
+		case "Dup":
+			dup = &g.Nodes[i]
+		case "Root":
+			root = &g.Nodes[i]
+		}
+	}
+	if dup == nil || root == nil {
+		t.Fatalf("expected Root and Dup nodes, got %+v", g.Nodes)
+	}
+	if dup.DefinitionCount != 2 || len(dup.Definitions) != 2 {
+		t.Fatalf("expected Dup annotated with 2 definitions, got count=%d defs=%+v", dup.DefinitionCount, dup.Definitions)
+	}
+	paths := map[string]bool{}
+	for _, d := range dup.Definitions {
+		paths[d.Path] = true
+		if d.StartLine == 0 || d.Language != "go" {
+			t.Fatalf("definition missing line/language: %+v", d)
+		}
+	}
+	if !paths["a.go"] || !paths["b.go"] {
+		t.Fatalf("expected definitions in a.go and b.go, got %+v", dup.Definitions)
+	}
+	// The unambiguous Root node carries no annotation.
+	if root.DefinitionCount != 0 || root.Definitions != nil {
+		t.Fatalf("unambiguous Root should have no annotation, got count=%d defs=%+v", root.DefinitionCount, root.Definitions)
+	}
+}
