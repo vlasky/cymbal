@@ -1136,6 +1136,17 @@ func InvestigateResolved(dbPath string, sym SymbolResult, opts ...InvestigateOpt
 	return res, nil
 }
 
+// SymbolLanguages returns the distinct languages of indexed symbols with the
+// given name. Empty when the name isn't indexed. Used to detect a seed name
+// that spans multiple languages (an ambiguous starting point).
+func SymbolLanguages(dbPath, name string) ([]string, error) {
+	store, err := openCached(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return store.SymbolLanguages(name)
+}
+
 // FindImpact performs transitive caller analysis for a symbol, unrestricted by
 // language.
 func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, error) {

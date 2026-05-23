@@ -821,3 +821,51 @@ func TestTraceInvalidResolveScopeErrors(t *testing.T) {
 		t.Fatalf("expected invalid --resolve-scope error, got %v", err)
 	}
 }
+
+// TestTraceSurfacesAmbiguousSymbolLanguages verifies that when a requested name
+// exists in more than one language, trace reports symbol_languages — and omits
+// it for an unambiguous seed.
+func TestTraceSurfacesAmbiguousSymbolLanguages(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("CYMBAL_CACHE_DIR", t.TempDir())
+	// 'Process' is defined in both Go and Python; 'Run' only in Go.
+	writeFile(t, repo, "a.go", "package a\nfunc Process() { Helper() }\nfunc Run() { Helper() }\nfunc Helper() {}\n")
+	writeFile(t, repo, "b.py", "def Process():\n    pass\n")
+	runGit(t, repo, "init")
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "-c", "user.name=T", "-c", "user.email=t@e.invalid", "commit", "-m", "x")
+	if _, err := index.Index(repo, "", index.Options{Workers: 1, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	dbPath, err := index.RepoDBPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(index.CloseAll)
+
+	// Ambiguous seed: symbol_languages present with both languages.
+	ambigCmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, ambigCmd, "json", "true")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(ambigCmd, []string{"Process"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOutputContains(t, stdout, `"symbol_languages"`)
+	requireOutputContains(t, stdout, `"go"`)
+	requireOutputContains(t, stdout, `"python"`)
+
+	// Unambiguous seed (Go-only 'Run'): no symbol_languages.
+	plainCmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, plainCmd, "json", "true")
+	stdout, _, err = captureProcessOutput(t, func() error {
+		return traceCmd.RunE(plainCmd, []string{"Run"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout, "symbol_languages") {
+		t.Fatalf("unambiguous seed should omit symbol_languages, got:\n%s", stdout)
+	}
+}
