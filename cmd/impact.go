@@ -64,6 +64,8 @@ Examples:
 			return fmt.Errorf("no callers found for any of: %s", strings.Join(names, ", "))
 		}
 
+		ambig := ambiguousSymbolLanguages(plan, names)
+
 		if jsonOut {
 			enriched := enrichImpact(merged, ctx)
 			// One object shape for any symbol count. Each result carries
@@ -76,13 +78,17 @@ Examples:
 					"hit_symbols": sourceMap[impactKey(merged[i])],
 				})
 			}
-			return writeJSON(map[string]any{
+			payload := map[string]any{
 				"symbols":       names,
 				"total_callers": len(merged),
 				"raw_rows":      totalRaw,
 				"resolve_scope": string(scope),
 				"results":       out,
-			})
+			}
+			if len(ambig) > 0 {
+				payload["symbol_languages"] = ambig
+			}
+			return writeJSON(payload)
 		}
 
 		// Group by depth.
@@ -139,6 +145,9 @@ Examples:
 		}
 		meta = append(meta, kv{"total_callers", fmt.Sprintf("%d", len(merged))})
 		meta = append(meta, kv{"resolve_scope", string(scope)})
+		if s := formatSymbolLanguages(ambig); s != "" {
+			meta = append(meta, kv{"symbol_languages", s})
+		}
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}

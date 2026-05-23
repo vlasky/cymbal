@@ -92,6 +92,8 @@ Examples:
 			return nil
 		}
 
+		ambig := ambiguousSymbolLanguages(plan, names)
+
 		if jsonOut {
 			// One object shape for any symbol count. Each result carries
 			// hit_symbols attribution (which requested symbols reached the
@@ -103,7 +105,7 @@ Examples:
 					"hit_symbols": sourceMap[traceKey(r)],
 				})
 			}
-			return writeJSON(map[string]any{
+			payload := map[string]any{
 				"symbols":       names,
 				"direction":     "downward (callees)",
 				"depth":         depth,
@@ -111,7 +113,11 @@ Examples:
 				"raw_rows":      totalRaw,
 				"resolve_scope": string(scope),
 				"results":       out,
-			})
+			}
+			if len(ambig) > 0 {
+				payload["symbol_languages"] = ambig
+			}
+			return writeJSON(payload)
 		}
 
 		var content strings.Builder
@@ -138,6 +144,9 @@ Examples:
 		meta = append(meta, kv{"depth", fmt.Sprintf("%d", depth)})
 		meta = append(meta, kv{"edges", fmt.Sprintf("%d", len(merged))})
 		meta = append(meta, kv{"resolve_scope", string(scope)})
+		if s := formatSymbolLanguages(ambig); s != "" {
+			meta = append(meta, kv{"symbol_languages", s})
+		}
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}

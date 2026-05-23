@@ -4,10 +4,52 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
+	"github.com/1broseidon/cymbal/index"
 	"github.com/spf13/cobra"
 )
+
+// ambiguousSymbolLanguages returns, for each requested name that is defined in
+// more than one language, the sorted list of those languages. Names defined in
+// a single language (or none) are omitted. Used by trace/impact to flag a
+// starting symbol that spans languages — resolve-scope governs how a call
+// resolves per language, it does not pick between the same-named symbols.
+func ambiguousSymbolLanguages(plan DBPlan, names []string) map[string][]string {
+	out := map[string][]string{}
+	for _, name := range names {
+		if _, ok := out[name]; ok {
+			continue
+		}
+		entry, _ := findSymbolEntry(plan, name)
+		langs, err := index.SymbolLanguages(entry.Path, name)
+		if err != nil || len(langs) < 2 {
+			continue
+		}
+		sort.Strings(langs)
+		out[name] = langs
+	}
+	return out
+}
+
+// formatSymbolLanguages renders ambiguousSymbolLanguages for frontmatter, e.g.
+// "App=go,tsx; Bar=java,kotlin". Empty when no name spans languages.
+func formatSymbolLanguages(m map[string][]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, n := range names {
+		parts = append(parts, n+"="+strings.Join(m[n], ","))
+	}
+	return strings.Join(parts, "; ")
+}
 
 // Multi-symbol ergonomics shared by show, impls, impact, and trace.
 //
