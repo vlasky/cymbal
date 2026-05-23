@@ -240,3 +240,45 @@ func TestBadExtensionPanics(t *testing.T) {
 		Language{Name: "bad", Extensions: []string{"nodot"}},
 	)
 }
+
+func TestFamily(t *testing.T) {
+	eq := func(got, want []string) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	tests := []struct {
+		name string
+		want []string // sorted
+	}{
+		// Interop families (members returned sorted, including the queried name).
+		{"java", []string{"java", "kotlin", "scala"}},
+		{"kotlin", []string{"java", "kotlin", "scala"}},
+		{"scala", []string{"java", "kotlin", "scala"}},
+		{"javascript", []string{"javascript", "tsx", "typescript"}},
+		{"typescript", []string{"javascript", "tsx", "typescript"}},
+		{"tsx", []string{"javascript", "tsx", "typescript"}},
+		{"c", []string{"c", "cpp"}},
+		{"cpp", []string{"c", "cpp"}},
+		// No declared family: scopes to itself.
+		{"go", []string{"go"}},
+		{"python", []string{"python"}},
+		{"csharp", []string{"csharp"}},
+		// Unknown name: itself; empty: nil.
+		{"madeuplang", []string{"madeuplang"}},
+		{"", nil},
+	}
+	for _, tt := range tests {
+		got := Default.Family(tt.name)
+		if !eq(got, tt.want) {
+			t.Errorf("Family(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
