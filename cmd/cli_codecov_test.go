@@ -40,6 +40,7 @@ func newImpactTestCommand(dbPath string) *cobra.Command {
 	cmd.Flags().IntP("context", "C", 1, "")
 	addStdinFlag(cmd)
 	addGraphFlags(cmd)
+	addResolveScopeFlag(cmd)
 	return cmd
 }
 
@@ -50,6 +51,7 @@ func newTraceTestCommand(dbPath string) *cobra.Command {
 	cmd.Flags().String("kinds", "call", "")
 	addStdinFlag(cmd)
 	addGraphFlags(cmd)
+	addResolveScopeFlag(cmd)
 	return cmd
 }
 

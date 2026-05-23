@@ -754,3 +754,70 @@ func impactHasCaller(rows []index.ImpactResult, name string) bool {
 	}
 	return false
 }
+
+// TestTraceSingleSymbolJSONIsObjectWithScope verifies the unified JSON shape:
+// single-symbol trace --json is now the same object as multi-symbol, carrying
+// resolve_scope and results[].hit_symbols (no longer a bare array).
+func TestTraceSingleSymbolJSONIsObjectWithScope(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, cmd, "json", "true")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout), "[") {
+		t.Fatalf("single-symbol trace --json should be an object, got array: %s", stdout)
+	}
+	requireOutputContains(t, stdout, `"resolve_scope": "family"`)
+	requireOutputContains(t, stdout, `"results":`)
+	requireOutputContains(t, stdout, `"hit_symbols":`)
+}
+
+// TestImpactSingleSymbolJSONIsObjectWithScope mirrors the trace case for impact.
+func TestImpactSingleSymbolJSONIsObjectWithScope(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newImpactTestCommand(dbPath)
+	setTestFlag(t, cmd, "json", "true")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return impactCmd.RunE(cmd, []string{"helper"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout), "[") {
+		t.Fatalf("single-symbol impact --json should be an object, got array: %s", stdout)
+	}
+	requireOutputContains(t, stdout, `"resolve_scope": "family"`)
+	requireOutputContains(t, stdout, `"results":`)
+}
+
+// TestTraceGraphJSONHasResolveScope checks the graph JSON surfaces resolve_scope.
+func TestTraceGraphJSONHasResolveScope(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, cmd, "graph-format", "json")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOutputContains(t, stdout, `"resolve_scope": "family"`)
+}
+
+// TestTraceInvalidResolveScopeErrors checks an unknown --resolve-scope value is
+// a hard error rather than a silent family default.
+func TestTraceInvalidResolveScopeErrors(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, cmd, "resolve-scope", "bogus")
+	_, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid --resolve-scope") {
+		t.Fatalf("expected invalid --resolve-scope error, got %v", err)
+	}
+}

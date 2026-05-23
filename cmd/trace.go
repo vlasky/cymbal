@@ -28,7 +28,10 @@ them in the text/JSON output (and as dashed ext: nodes in --graph mode).
 A callee resolves only within its caller's language family by default
 (--resolve-scope family: JVM java/kotlin/scala, JS javascript/typescript/tsx,
 C c/cpp). Use --resolve-scope same for exact-language only, or all to resolve
-across every language.
+across every language. This affects which callees a name resolves to, not
+which symbol the trace starts from: if the symbol you ask about exists in more
+than one language, the trace still covers each. Add a file hint like
+pkg/file.go:Name to target a single symbol.
 
 Multi-symbol: pass more than one name (or pipe via --stdin) to get the
 union of callees across all requested symbols. Shared callees are deduped
@@ -52,7 +55,10 @@ Examples:
 		kindsRaw, _ := cmd.Flags().GetString("kinds")
 		kinds := parseKindsFlag(kindsRaw)
 		includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
-		scope := resolveScopeFlag(cmd)
+		scope, err := resolveScopeOrError(cmd)
+		if err != nil {
+			return err
+		}
 
 		// Strip file-hint prefixes ("pkg/file.go:Sym" -> "Sym"); trace resolves
 		// by name internally so the hint is informational.
@@ -87,26 +93,25 @@ Examples:
 		}
 
 		if jsonOut {
-			if len(names) > 1 {
-				// Attach hit_symbols attribution.
-				out := make([]map[string]any, 0, len(merged))
-				for _, r := range merged {
-					out = append(out, map[string]any{
-						"row":         r,
-						"hit_symbols": sourceMap[traceKey(r)],
-					})
-				}
-				return writeJSON(map[string]any{
-					"symbols":       names,
-					"direction":     "downward (callees)",
-					"depth":         depth,
-					"edges":         len(merged),
-					"raw_rows":      totalRaw,
-					"resolve_scope": string(scope),
-					"results":       out,
+			// One object shape for any symbol count. Each result carries
+			// hit_symbols attribution (which requested symbols reached the
+			// callee); for a single symbol that's just that symbol.
+			out := make([]map[string]any, 0, len(merged))
+			for _, r := range merged {
+				out = append(out, map[string]any{
+					"row":         r,
+					"hit_symbols": sourceMap[traceKey(r)],
 				})
 			}
-			return writeJSON(merged)
+			return writeJSON(map[string]any{
+				"symbols":       names,
+				"direction":     "downward (callees)",
+				"depth":         depth,
+				"edges":         len(merged),
+				"raw_rows":      totalRaw,
+				"resolve_scope": string(scope),
+				"results":       out,
+			})
 		}
 
 		var content strings.Builder

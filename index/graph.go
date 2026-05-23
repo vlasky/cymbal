@@ -103,6 +103,9 @@ type GraphResult struct {
 	// Truncated reports how many nodes were dropped by the Limit cap.
 	// Zero when no truncation happened.
 	Truncated int `json:"truncated,omitempty"`
+	// ResolveScope is the active cross-language resolution scope (down/trace
+	// direction). Empty when not applicable (e.g. importer/impls graphs).
+	ResolveScope ResolveScope `json:"resolve_scope,omitempty"`
 }
 
 type graphSymbolMeta struct {
@@ -155,8 +158,9 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 		// Always collect unresolved callees so GraphResult.Unresolved
 		// diagnostics are populated regardless of q.IncludeUnresolved;
 		// addUnresolvedEdge gates whether ext: nodes/edges are actually
-		// rendered. UnresolvedExemptFromLimit keeps a flood of external calls
-		// from crowding out resolved traversal within the 1000 cap.
+		// rendered. UnresolvedExemptFromLimit makes the 1000 cap bound only
+		// resolved traversal breadth, so external/scope-filtered calls don't
+		// crowd it out — the unresolved diagnostics themselves are not capped.
 		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{
 			IncludeUnresolved:         true,
 			UnresolvedExemptFromLimit: true,
@@ -189,6 +193,8 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 	if q.Limit > 0 && len(result.Nodes) > q.Limit {
 		result = truncateByDegree(result, q.Limit, graphNodeID(q.Symbol))
 	}
+	// Set last so it survives builder.result and truncation.
+	result.ResolveScope = NormalizeScope(q.ResolveScope)
 	return result, nil
 }
 
