@@ -299,3 +299,123 @@ func TestFindTraceDefaultFiltersToCallKind(t *testing.T) {
 		t.Errorf("expected widened trace to include UUID; got %+v", wide)
 	}
 }
+
+// TestFindTraceFiltersUnresolvedCalleesByDefault is the regression for the
+// default unresolved-filtering behavior: a call to a symbol that isn't in the
+// index (stdlib/third-party/builtin) is dropped by default and surfaced only
+// when IncludeUnresolved is set.
+func TestFindTraceFiltersUnresolvedCalleesByDefault(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	fid, err := store.UpsertFile("/repo/a.go", "a.go", "go", "h", now, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertSymbols(fid, []symbols.Symbol{
+		{Name: "load", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 10, Language: "go"},
+		{Name: "fetch", Kind: "function", File: "/repo/a.go", StartLine: 12, EndLine: 20, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(fid, []symbols.Ref{
+		// resolved: 'fetch' is an indexed symbol.
+		{Name: "fetch", Line: 3, Language: "go", Kind: symbols.RefKindCall},
+		// unresolved: 'Sprintf' has no indexed symbol (external).
+		{Name: "Sprintf", Line: 4, Language: "go", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default: resolved 'fetch' kept, unresolved 'Sprintf' dropped.
+	def, err := store.FindTrace("load", 2, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var defFetch, defSprintf bool
+	for _, tr := range def {
+		switch tr.Callee {
+		case "fetch":
+			defFetch = true
+		case "Sprintf":
+			defSprintf = true
+		}
+	}
+	if !defFetch || defSprintf {
+		t.Fatalf("default trace should keep resolved 'fetch' and drop unresolved 'Sprintf', got %+v", def)
+	}
+
+	// Opt-in: IncludeUnresolved surfaces the external callee too.
+	all, err := store.FindTraceWithOptions("load", 2, 50, TraceOptions{IncludeUnresolved: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var allFetch, allSprintf bool
+	for _, tr := range all {
+		switch tr.Callee {
+		case "fetch":
+			allFetch = true
+		case "Sprintf":
+			allSprintf = true
+		}
+	}
+	if !allFetch || !allSprintf {
+		t.Fatalf("IncludeUnresolved should surface both 'fetch' and 'Sprintf', got %+v", all)
+	}
+}
+
+// TestFindTraceUnresolvedExemptFromLimit verifies the limit guard: when
+// unresolved callees are exempted from the limit (the graph path), resolved
+// traversal still reaches full depth even when external calls are abundant —
+// they can't crowd out resolved edges within the budget.
+func TestFindTraceUnresolvedExemptFromLimit(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	fid, err := store.UpsertFile("/repo/a.go", "a.go", "go", "h", now, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertSymbols(fid, []symbols.Symbol{
+		{Name: "load", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 10, Language: "go"},
+		{Name: "mid", Kind: "function", File: "/repo/a.go", StartLine: 12, EndLine: 20, Language: "go"},
+		{Name: "leaf", Kind: "function", File: "/repo/a.go", StartLine: 22, EndLine: 30, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(fid, []symbols.Ref{
+		// abundant unresolved fan-out from load()
+		{Name: "ext1", Line: 2, Language: "go", Kind: symbols.RefKindCall},
+		{Name: "ext2", Line: 3, Language: "go", Kind: symbols.RefKindCall},
+		{Name: "ext3", Line: 4, Language: "go", Kind: symbols.RefKindCall},
+		{Name: "ext4", Line: 5, Language: "go", Kind: symbols.RefKindCall},
+		// one resolved callee that itself calls a resolved leaf
+		{Name: "mid", Line: 6, Language: "go", Kind: symbols.RefKindCall},
+		{Name: "leaf", Line: 13, Language: "go", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// limit (3) is smaller than the unresolved fan-out (4). Without the
+	// exemption these could consume the budget before resolved traversal
+	// reaches 'leaf' at depth 2.
+	rows, err := store.FindTraceWithOptions("load", 3, 3, TraceOptions{
+		IncludeUnresolved:         true,
+		UnresolvedExemptFromLimit: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawMid, sawLeaf bool
+	for _, tr := range rows {
+		switch tr.Callee {
+		case "mid":
+			sawMid = true
+		case "leaf":
+			sawLeaf = true
+		}
+	}
+	if !sawMid || !sawLeaf {
+		t.Fatalf("resolved traversal (mid->leaf) must survive unresolved fan-out under exemption, got %+v", rows)
+	}
+}

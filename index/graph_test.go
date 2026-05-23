@@ -89,6 +89,44 @@ func TestBuildGraphSymbolModeScopeExcludeDepthAndUnresolved(t *testing.T) {
 	}
 }
 
+// TestBuildGraphRecordsUnresolvedDiagnosticsByDefault is the regression for
+// graph diagnostics: even with IncludeUnresolved off (the default), external
+// calls must still be recorded in GraphResult.Unresolved — they just aren't
+// rendered as ext: nodes/edges. Previously the default filtered them out at the
+// trace layer so they never reached the builder.
+func TestBuildGraphRecordsUnresolvedDiagnosticsByDefault(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	appID, _ := store.UpsertFile("/repo/app/main.go", "app/main.go", "go", "h1", now, 100)
+	libID, _ := store.UpsertFile("/repo/lib/lib.go", "lib/lib.go", "go", "h2", now, 100)
+	_ = store.InsertSymbols(appID, []symbols.Symbol{{Name: "Entry", Kind: "function", File: "/repo/app/main.go", StartLine: 1, EndLine: 20, Language: "go"}})
+	_ = store.InsertSymbols(libID, []symbols.Symbol{{Name: "Helper", Kind: "function", File: "/repo/lib/lib.go", StartLine: 1, EndLine: 20, Language: "go"}})
+	_ = store.InsertRefs(appID, []symbols.Ref{
+		{Name: "Helper", Line: 2, Language: "go", Kind: symbols.RefKindCall},     // resolved
+		{Name: "fmt.Printf", Line: 3, Language: "go", Kind: symbols.RefKindCall}, // unresolved (external)
+	})
+
+	// Default mode: IncludeUnresolved is false.
+	graph, err := store.BuildGraph(GraphQuery{Symbol: "Entry", Direction: GraphDirectionDown, Depth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Diagnostics are recorded for the external call...
+	if len(graph.Unresolved) != 1 || graph.Unresolved[0].ResolvedAs != "ext:fmt.Printf" {
+		t.Fatalf("expected fmt.Printf recorded as unresolved diagnostic by default, got %+v", graph.Unresolved)
+	}
+	// ...but no ext: node is rendered, and the only edge is the resolved one.
+	for _, n := range graph.Nodes {
+		if n.Kind == GraphNodeKindExternal {
+			t.Fatalf("default mode must not render external nodes, got %+v", graph.Nodes)
+		}
+	}
+	if len(graph.Edges) != 1 || !graph.Edges[0].Resolved {
+		t.Fatalf("expected a single resolved Entry->Helper edge, got %+v", graph.Edges)
+	}
+}
+
 func TestBuildGraphEmptyGraphIsWellFormed(t *testing.T) {
 	store, _ := newTestStore(t)
 	graph, err := store.BuildGraph(GraphQuery{Symbol: "Missing", Direction: GraphDirectionDown})

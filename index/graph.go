@@ -122,7 +122,15 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 
 	builder := newGraphBuilder(q, metas)
 	if graphDirectionIncludesDown(q.Direction) {
-		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{IncludeUnresolved: q.IncludeUnresolved})
+		// Always collect unresolved callees so GraphResult.Unresolved
+		// diagnostics are populated regardless of q.IncludeUnresolved;
+		// addUnresolvedEdge gates whether ext: nodes/edges are actually
+		// rendered. UnresolvedExemptFromLimit keeps a flood of external calls
+		// from crowding out resolved traversal within the 1000 cap.
+		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{
+			IncludeUnresolved:         true,
+			UnresolvedExemptFromLimit: true,
+		})
 		if err != nil {
 			return nil, err
 		}
