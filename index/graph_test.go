@@ -284,3 +284,81 @@ func TestBuildGraphLimitAddsSentinelAndTruncatedCount(t *testing.T) {
 		t.Fatalf("expected sentinel and root preserved, got %+v", truncated.Nodes)
 	}
 }
+
+// TestBuildGraphResolvesNestedMethodCallee is the regression for the depth>0
+// graph-metadata bug: a class-nested method (depth 1) calling another nested
+// method must produce a resolved edge, not be mislabeled external. Mirrors the
+// real Java parse of `class A { void handle(){ save(); } void save(){} }`.
+func TestBuildGraphResolvesNestedMethodCallee(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	fid, _ := store.UpsertFile("/repo/A.java", "A.java", "java", "h", now, 80)
+	if err := store.InsertSymbols(fid, []symbols.Symbol{
+		{Name: "A", Kind: "class", File: "/repo/A.java", StartLine: 1, EndLine: 7, Language: "java"},
+		{Name: "handle", Kind: "method", File: "/repo/A.java", StartLine: 2, EndLine: 4, Language: "java", Depth: 1, Parent: "A"},
+		{Name: "save", Kind: "method", File: "/repo/A.java", StartLine: 5, EndLine: 6, Language: "java", Depth: 1, Parent: "A"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(fid, []symbols.Ref{
+		{Name: "save", Line: 3, Language: "java", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := store.BuildGraph(GraphQuery{Symbol: "handle", Direction: GraphDirectionDown, Depth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range g.Unresolved {
+		if u.ResolvedAs == "ext:save" {
+			t.Fatalf("nested method 'save' must not be classified %s, got %+v", u.Reason, g.Unresolved)
+		}
+	}
+	var resolved bool
+	for _, e := range g.Edges {
+		if e.Resolved && e.To == graphNodeID("save") {
+			resolved = true
+		}
+	}
+	if !resolved {
+		t.Fatalf("expected resolved handle->save edge, got %+v", g.Edges)
+	}
+}
+
+// TestBuildGraphImpactPreservesNestedCaller is the impact-direction counterpart:
+// an upward edge whose caller is a nested method must survive (previously the
+// depth>0 caller was dropped by the graph metadata filter).
+func TestBuildGraphImpactPreservesNestedCaller(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	fid, _ := store.UpsertFile("/repo/A.java", "A.java", "java", "h", now, 80)
+	if err := store.InsertSymbols(fid, []symbols.Symbol{
+		{Name: "A", Kind: "class", File: "/repo/A.java", StartLine: 1, EndLine: 7, Language: "java"},
+		{Name: "handle", Kind: "method", File: "/repo/A.java", StartLine: 2, EndLine: 4, Language: "java", Depth: 1, Parent: "A"},
+		{Name: "save", Kind: "method", File: "/repo/A.java", StartLine: 5, EndLine: 6, Language: "java", Depth: 1, Parent: "A"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(fid, []symbols.Ref{
+		{Name: "save", Line: 3, Language: "java", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := store.BuildGraph(GraphQuery{Symbol: "save", Direction: GraphDirectionUp, Depth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hasCallerEdge bool
+	for _, e := range g.Edges {
+		if e.Resolved && e.From == graphNodeID("handle") && e.To == graphNodeID("save") {
+			hasCallerEdge = true
+		}
+	}
+	if !hasCallerEdge {
+		t.Fatalf("expected impact edge handle->save (nested caller preserved), got %+v", g.Edges)
+	}
+}

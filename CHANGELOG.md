@@ -13,6 +13,10 @@ All notable changes to cymbal are documented here.
 
 - **BREAKING: single-symbol `trace --json` / `impact --json` now return the same object shape as multi-symbol** — previously a single symbol emitted a bare JSON array while multiple symbols emitted `{symbols, …, results}`. Both now emit the object form (`{symbols, …, resolve_scope, results: [{row, hit_symbols}]}`), so agent consumers parse one consistent shape regardless of symbol count. Scripts that parsed the top-level array must read `.results[].row` instead.
 
+### Fixed
+
+- **`--graph` no longer mislabels class-nested methods as external** — the graph builder's symbol metadata was restricted to top-level (`depth=0`) symbols, while `trace`/`impact` resolve against symbols at any depth. As a result, in class-based languages (Java, Python, TypeScript, …) a real method calling another method showed up in `trace --graph` / `impact --graph` as an `external` (stdlib/third-party) node with no resolved edge — even though `trace` text and `refs` correctly identified it. Graph metadata now covers all depths, so nested methods resolve as real nodes/edges. Go was largely unaffected (its functions/methods are top-level).
+
 ## [0.13.5] - 2026-05-19
 
 ### Fixed
