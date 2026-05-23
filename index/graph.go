@@ -79,6 +79,20 @@ type GraphNode struct {
 	Symbol   string        `json:"symbol,omitempty"`
 	Path     string        `json:"path,omitempty"`
 	Language string        `json:"language,omitempty"`
+	// DefinitionCount and Definitions annotate a node whose name is ambiguous
+	// — i.e. the index holds more than one symbol with this name. Because
+	// resolution is name-only, distinct same-named symbols collapse into this
+	// single node; the annotation lets a consumer see the conflation and
+	// investigate each definition. Both are omitted unless count > 1.
+	DefinitionCount int              `json:"definition_count,omitempty"`
+	Definitions     []GraphDefinition `json:"definitions,omitempty"`
+}
+
+// GraphDefinition locates one indexed definition of an ambiguous node's name.
+type GraphDefinition struct {
+	Path      string `json:"path,omitempty"`
+	Language  string `json:"language,omitempty"`
+	StartLine int    `json:"start_line,omitempty"`
 }
 
 type GraphEdge struct {
@@ -109,8 +123,9 @@ type GraphResult struct {
 }
 
 type graphSymbolMeta struct {
-	path     string
-	language string
+	path      string
+	language  string
+	startLine int
 }
 
 type graphBuilder struct {
@@ -328,7 +343,7 @@ func (b *graphBuilder) addNode(symbol string, meta graphSymbolMeta, kind GraphNo
 	if _, ok := b.nodes[id]; ok {
 		return id
 	}
-	b.nodes[id] = GraphNode{
+	node := GraphNode{
 		ID:       id,
 		Kind:     kind,
 		Label:    symbol,
@@ -336,8 +351,31 @@ func (b *graphBuilder) addNode(symbol string, meta graphSymbolMeta, kind GraphNo
 		Path:     meta.path,
 		Language: meta.language,
 	}
+	// Annotate name collisions: a name-only node that maps to more than one
+	// indexed definition is conflated (this single node stands for all of
+	// them). Surface the count and locations so a consumer can disambiguate.
+	if defs := b.metas[symbol]; len(defs) > 1 {
+		node.DefinitionCount = len(defs)
+		listed := defs
+		if len(listed) > graphMaxDefinitionsListed {
+			listed = listed[:graphMaxDefinitionsListed]
+		}
+		node.Definitions = make([]GraphDefinition, 0, len(listed))
+		for _, d := range listed {
+			node.Definitions = append(node.Definitions, GraphDefinition{
+				Path:      d.path,
+				Language:  d.language,
+				StartLine: d.startLine,
+			})
+		}
+	}
+	b.nodes[id] = node
 	return id
 }
+
+// graphMaxDefinitionsListed caps the per-node Definitions list for pathological
+// names; DefinitionCount remains the authoritative total.
+const graphMaxDefinitionsListed = 20
 
 func (b *graphBuilder) addExternal(symbol string) string {
 	id := graphNodeID(symbol)
@@ -458,7 +496,7 @@ func (s *Store) symbolMetas() (map[string][]graphSymbolMeta, error) {
 	// nested methods as external. Deterministic ordering keeps the name-only
 	// metas[0] fallback stable (top-level first, then language/path/line).
 	rows, err := s.db.Query(`
-		SELECT s.name, f.rel_path, s.language
+		SELECT s.name, f.rel_path, s.language, s.start_line
 		FROM symbols s
 		JOIN files f ON s.file_id = f.id
 		ORDER BY s.depth, s.language, f.rel_path, s.start_line
@@ -471,15 +509,17 @@ func (s *Store) symbolMetas() (map[string][]graphSymbolMeta, error) {
 	out := map[string][]graphSymbolMeta{}
 	for rows.Next() {
 		var name, relPath, language string
-		if err := rows.Scan(&name, &relPath, &language); err != nil {
+		var startLine int
+		if err := rows.Scan(&name, &relPath, &language, &startLine); err != nil {
 			continue
 		}
-		meta := graphSymbolMeta{path: filepath.ToSlash(relPath), language: language}
-		// Keep distinct languages/paths per name so callee resolution can
-		// match by language; drop exact duplicates (e.g. worktree dupes).
+		meta := graphSymbolMeta{path: filepath.ToSlash(relPath), language: language, startLine: startLine}
+		// Keep distinct definitions per name (used for ambiguity annotation)
+		// so callee resolution can match by language; drop exact duplicates
+		// such as the same symbol indexed across sibling worktrees.
 		dup := false
 		for _, m := range out[name] {
-			if m.language == meta.language && m.path == meta.path {
+			if m.language == meta.language && m.path == meta.path && m.startLine == meta.startLine {
 				dup = true
 				break
 			}
