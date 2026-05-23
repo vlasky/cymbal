@@ -1006,6 +1006,9 @@ type InvestigateResult struct {
 // InvestigateOpts controls symbol resolution for Investigate.
 type InvestigateOpts struct {
 	FileHint string // filter matches to symbols in this file path (substring match)
+	// Scope controls cross-language resolution for the refs/impact sections.
+	// Empty defaults to ResolveScopeFamily (see NormalizeScope).
+	Scope ResolveScope
 }
 
 func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*InvestigateResult, error) {
@@ -1043,6 +1046,12 @@ func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*Investiga
 	sym := results[0]
 	source := readLines(sym.File, sym.StartLine, sym.EndLine)
 
+	var scope ResolveScope
+	if len(opts) > 0 {
+		scope = opts[0].Scope
+	}
+	langs := scopeLanguages(sym.Language, scope)
+
 	res := &InvestigateResult{
 		Symbol: sym,
 		Source: source,
@@ -1051,14 +1060,14 @@ func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*Investiga
 	switch sym.Kind {
 	case "function", "method":
 		res.Kind = "function"
-		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
-		res.Impact, _ = store.FindImpactScoped(sym.Name, sym.Language, 2, 20)
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
+		res.Impact, _ = store.FindImpactInLangs(sym.Name, langs, 2, 20)
 
 	case "class", "struct", "type", "interface", "trait", "enum", "object", "mixin", "extension", "protocol", "record", "actor":
 		res.Kind = "type"
 		res.Members, _ = store.ChildSymbols(sym.Name, 50, sym.File)
 		// For types, show who references the type name.
-		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
 		// Inheritance / conformance edges (both directions, best-effort).
 		res.Implementors, _ = store.FindImplementors(sym.Name, 20)
 		res.Implements, _ = store.FindImplements(sym.Name, 20)
@@ -1066,7 +1075,7 @@ func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*Investiga
 	default:
 		// Unknown kind — return source + refs as best effort.
 		res.Kind = sym.Kind
-		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
 	}
 
 	return res, nil
@@ -1074,11 +1083,17 @@ func Investigate(dbPath, symbolName string, opts ...InvestigateOpts) (*Investiga
 
 // InvestigateResolved builds an InvestigateResult for a pre-resolved symbol.
 // Use when the caller already resolved the symbol (e.g., via flexResolve).
-func InvestigateResolved(dbPath string, sym SymbolResult) (*InvestigateResult, error) {
+func InvestigateResolved(dbPath string, sym SymbolResult, opts ...InvestigateOpts) (*InvestigateResult, error) {
 	store, err := openCached(dbPath)
 	if err != nil {
 		return nil, err
 	}
+
+	var scope ResolveScope
+	if len(opts) > 0 {
+		scope = opts[0].Scope
+	}
+	langs := scopeLanguages(sym.Language, scope)
 
 	// Cap source for large type symbols — members are listed separately.
 	const maxTypeLines = 60
@@ -1105,23 +1120,24 @@ func InvestigateResolved(dbPath string, sym SymbolResult) (*InvestigateResult, e
 	switch sym.Kind {
 	case "function", "method":
 		res.Kind = "function"
-		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
-		res.Impact, _ = store.FindImpactScoped(sym.Name, sym.Language, 2, 20)
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
+		res.Impact, _ = store.FindImpactInLangs(sym.Name, langs, 2, 20)
 	case "class", "struct", "type", "interface", "trait", "enum", "object", "mixin", "extension", "protocol", "record", "actor":
 		res.Kind = "type"
 		res.Members, _ = store.ChildSymbols(sym.Name, 50, sym.File)
-		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
 		res.Implementors, _ = store.FindImplementors(sym.Name, 20)
 		res.Implements, _ = store.FindImplements(sym.Name, 20)
 	default:
 		res.Kind = sym.Kind
-		res.Refs, _ = store.FindReferencesScoped(sym.Name, sym.Language, 20)
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
 	}
 
 	return res, nil
 }
 
-// FindImpact performs transitive caller analysis for a symbol.
+// FindImpact performs transitive caller analysis for a symbol, unrestricted by
+// language.
 func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, error) {
 	if limit <= 0 {
 		limit = 100
@@ -1131,6 +1147,28 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 		return nil, err
 	}
 	return store.FindImpact(symbolName, depth, limit)
+}
+
+// FindImpactWithScope is FindImpact constrained to a resolution scope. It
+// derives the scope from the seed symbol's indexed language(s): callers are
+// followed only through refs in those languages (family-expanded by default).
+// With ResolveScopeAll, an unknown seed, or a seed spanning languages that
+// can't be jointly scoped, it is unrestricted.
+func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int) ([]ImpactResult, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	store, err := openCached(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	var langs []string
+	if NormalizeScope(scope) != ResolveScopeAll {
+		if seedLangs, err := store.SymbolLanguages(symbolName); err == nil {
+			langs = scopeLanguagesUnion(seedLangs, scope)
+		}
+	}
+	return store.FindImpactInLangs(symbolName, langs, depth, limit)
 }
 
 // FindTrace performs downward call graph traversal for a symbol.

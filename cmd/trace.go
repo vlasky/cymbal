@@ -25,6 +25,11 @@ Callees that don't resolve to an indexed symbol (stdlib, third-party, or
 builtins) are filtered out by default. Pass --include-unresolved to keep
 them in the text/JSON output (and as dashed ext: nodes in --graph mode).
 
+A callee resolves only within its caller's language family by default
+(--resolve-scope family: JVM java/kotlin/scala, JS javascript/typescript/tsx,
+C c/cpp). Use --resolve-scope same for exact-language only, or all to resolve
+across every language.
+
 Multi-symbol: pass more than one name (or pipe via --stdin) to get the
 union of callees across all requested symbols. Shared callees are deduped
 and a hit_symbols attribution list records which of the requested symbols
@@ -47,6 +52,7 @@ Examples:
 		kindsRaw, _ := cmd.Flags().GetString("kinds")
 		kinds := parseKindsFlag(kindsRaw)
 		includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
+		scope := resolveScopeFlag(cmd)
 
 		// Strip file-hint prefixes ("pkg/file.go:Sym" -> "Sym"); trace resolves
 		// by name internally so the hint is informational.
@@ -65,7 +71,7 @@ Examples:
 			return renderAsGraph(cmd, entry.Path, names, index.GraphDirectionDown, 2)
 		}
 
-		opts := index.TraceOptions{IncludeUnresolved: includeUnresolved}
+		opts := index.TraceOptions{IncludeUnresolved: includeUnresolved, Scope: scope}
 		merged, sourceMap, labelMap, totalRaw, err := mergeTracePlan(plan, names, depth, limit, kinds, opts)
 		_ = labelMap
 		if err != nil {
@@ -91,12 +97,13 @@ Examples:
 					})
 				}
 				return writeJSON(map[string]any{
-					"symbols":   names,
-					"direction": "downward (callees)",
-					"depth":     depth,
-					"edges":     len(merged),
-					"raw_rows":  totalRaw,
-					"results":   out,
+					"symbols":       names,
+					"direction":     "downward (callees)",
+					"depth":         depth,
+					"edges":         len(merged),
+					"raw_rows":      totalRaw,
+					"resolve_scope": string(scope),
+					"results":       out,
 				})
 			}
 			return writeJSON(merged)
@@ -125,6 +132,7 @@ Examples:
 		meta = append(meta, kv{"direction", "downward (callees)"})
 		meta = append(meta, kv{"depth", fmt.Sprintf("%d", depth)})
 		meta = append(meta, kv{"edges", fmt.Sprintf("%d", len(merged))})
+		meta = append(meta, kv{"resolve_scope", string(scope)})
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}
@@ -211,6 +219,7 @@ func init() {
 		"comma-separated ref kinds to follow: call, use, implements (default call)")
 	addStdinFlag(traceCmd)
 	addGraphFlags(traceCmd)
+	addResolveScopeFlag(traceCmd)
 	rootCmd.AddCommand(traceCmd)
 }
 

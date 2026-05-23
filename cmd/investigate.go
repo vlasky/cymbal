@@ -35,12 +35,13 @@ Examples:
 		plan := resolveDBs(cmd)
 		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
+		scope := resolveScopeFlag(cmd)
 
 		if jsonOut && len(args) > 1 {
 			var all []any
 			for _, name := range args {
 				entry, _ := findSymbolEntry(plan, name)
-				data := investigateOne(entry.Path, name)
+				data := investigateOne(entry.Path, name, scope)
 				if label := entry.Label(); label != "" {
 					data["worktree"] = label
 				}
@@ -54,7 +55,7 @@ Examples:
 				fmt.Println()
 			}
 			entry, _ := findSymbolEntry(plan, name)
-			if err := investigateOnePrint(entry.Path, name, jsonOut, entry.Label()); err != nil {
+			if err := investigateOnePrint(entry.Path, name, jsonOut, entry.Label(), scope); err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
 			}
 		}
@@ -62,7 +63,7 @@ Examples:
 	},
 }
 
-func investigateOne(dbPath, name string) map[string]any {
+func investigateOne(dbPath, name string, scope index.ResolveScope) map[string]any {
 	res, err := flexResolve(dbPath, name)
 	if err != nil {
 		return map[string]any{"symbol": name, "error": err.Error()}
@@ -71,11 +72,11 @@ func investigateOne(dbPath, name string) map[string]any {
 		return map[string]any{"symbol": name, "error": "not found"}
 	}
 	sym := res.Results[0]
-	result, err := index.InvestigateResolved(dbPath, sym)
+	result, err := index.InvestigateResolved(dbPath, sym, index.InvestigateOpts{Scope: scope})
 	if err != nil {
 		return map[string]any{"symbol": name, "error": err.Error()}
 	}
-	data := map[string]any{"result": result}
+	data := map[string]any{"result": result, "resolve_scope": string(index.NormalizeScope(scope))}
 	if res.TotalFound > 1 {
 		data["matches"] = res.TotalFound
 	}
@@ -85,7 +86,7 @@ func investigateOne(dbPath, name string) map[string]any {
 	return data
 }
 
-func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string) error {
+func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string, scope index.ResolveScope) error {
 	res, err := flexResolve(dbPath, name)
 	if err != nil {
 		return err
@@ -95,13 +96,13 @@ func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string
 	}
 
 	sym := res.Results[0]
-	result, err := index.InvestigateResolved(dbPath, sym)
+	result, err := index.InvestigateResolved(dbPath, sym, index.InvestigateOpts{Scope: scope})
 	if err != nil {
 		return err
 	}
 
 	if jsonOut {
-		data := map[string]any{"result": result}
+		data := map[string]any{"result": result, "resolve_scope": string(index.NormalizeScope(scope))}
 		if res.TotalFound > 1 {
 			data["matches"] = res.TotalFound
 		}
@@ -197,6 +198,7 @@ func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string
 		{"kind", sym.Kind},
 		{"investigate", result.Kind},
 		{"file", fmt.Sprintf("%s:%d", sym.RelPath, sym.StartLine)},
+		{"resolve_scope", string(index.NormalizeScope(scope))},
 	}
 	if worktreeLabel != "" {
 		meta = append(meta, kv{"worktree", worktreeLabel})
@@ -216,5 +218,6 @@ func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string
 }
 
 func init() {
+	addResolveScopeFlag(investigateCmd)
 	rootCmd.AddCommand(investigateCmd)
 }
