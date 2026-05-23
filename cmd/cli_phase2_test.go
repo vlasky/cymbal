@@ -435,12 +435,12 @@ func TestPhase3CommandSearchShowInvestigateAndImporters(t *testing.T) {
 		t.Fatal("repoRootForPath should resolve indexed repo root")
 	}
 
-	investigated := investigateOne(dbPath, "execute")
+	investigated := investigateOne(dbPath, "execute", index.ResolveScopeFamily)
 	if investigated["fuzzy"] != true {
 		t.Fatalf("expected fuzzy investigate for lowercase execute: %+v", investigated)
 	}
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return investigateOnePrint(dbPath, "Service", false, "")
+		return investigateOnePrint(dbPath, "Service", false, "", index.ResolveScopeFamily)
 	})
 	if err != nil {
 		t.Fatal(err)

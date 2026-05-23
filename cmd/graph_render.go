@@ -27,6 +27,24 @@ func addGraphFlags(cmd *cobra.Command) {
 	cmd.Flags().Int("graph-limit", 0, "cap graph at top-N nodes by degree (0 = no cap)")
 }
 
+// addResolveScopeFlag wires the shared --resolve-scope flag onto verbs that do
+// name-based cross-language resolution (trace, impact, investigate).
+func addResolveScopeFlag(cmd *cobra.Command) {
+	cmd.Flags().String("resolve-scope", string(index.ResolveScopeFamily),
+		"cross-language name resolution: same (exact language) | family (interop group, default) | all (any language)")
+}
+
+// resolveScopeFlag reads --resolve-scope, normalizing empty/unknown values to
+// the family default. Safe to call on verbs that didn't register the flag
+// (returns the family default).
+func resolveScopeFlag(cmd *cobra.Command) index.ResolveScope {
+	if cmd.Flags().Lookup("resolve-scope") == nil {
+		return index.ResolveScopeFamily
+	}
+	raw, _ := cmd.Flags().GetString("resolve-scope")
+	return index.NormalizeScope(index.ResolveScope(strings.TrimSpace(raw)))
+}
+
 // graphRequested reports whether the user asked for graph output on a verb
 // that supports --graph. Returns true if --graph was passed or --graph-format
 // was set to a non-empty value.
@@ -145,6 +163,7 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 	}
 	depth := graphDepthOrDefault(cmd, graphDefaultDepth)
 	includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
+	scope := resolveScopeFlag(cmd)
 
 	graphs := make([]*index.GraphResult, 0, len(symbols))
 	rootIDs := make(map[string]bool, len(symbols))
@@ -154,6 +173,7 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 			Direction:         direction,
 			Depth:             depth,
 			IncludeUnresolved: includeUnresolved,
+			ResolveScope:      scope,
 		}
 		g, err := index.BuildGraph(dbPath, q)
 		if err != nil {

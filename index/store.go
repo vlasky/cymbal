@@ -1029,45 +1029,41 @@ type RefResult struct {
 // and a same-language scope avoids mixing in calls to a same-named symbol in
 // another language (e.g. Go struct App vs TSX function App).
 func (s *Store) FindReferencesScoped(name, language string, limit int, kinds ...string) ([]RefResult, error) {
-	if language == "" {
+	var langs []string
+	if language != "" {
+		langs = []string{language}
+	}
+	return s.FindReferencesInLangs(name, langs, limit, kinds...)
+}
+
+// FindReferencesInLangs is FindReferences restricted to a set of languages.
+// A nil/empty langs set applies no restriction (equivalent to FindReferences).
+func (s *Store) FindReferencesInLangs(name string, langs []string, limit int, kinds ...string) ([]RefResult, error) {
+	if len(langs) == 0 {
 		return s.FindReferences(name, limit, kinds...)
 	}
-	if len(kinds) == 0 {
-		rows, err := s.db.Query(`
-			SELECT f.path, f.rel_path, r.line, r.name
-			FROM refs r JOIN files f ON r.file_id = f.id
-			WHERE r.name = ? AND r.language = ?
-			ORDER BY f.rel_path, r.line
-			LIMIT ?
-		`, name, language, limit)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		var results []RefResult
-		for rows.Next() {
-			var r RefResult
-			if err := rows.Scan(&r.File, &r.RelPath, &r.Line, &r.Name); err != nil {
-				return nil, err
-			}
-			results = append(results, r)
-		}
-		return results, rows.Err()
+	langPh := strings.Repeat("?,", len(langs))
+	langPh = langPh[:len(langPh)-1]
+	args := []interface{}{name}
+	for _, l := range langs {
+		args = append(args, l)
 	}
-	kindPlaceholders := strings.Repeat("?,", len(kinds))
-	kindPlaceholders = kindPlaceholders[:len(kindPlaceholders)-1]
-	args := []interface{}{name, language}
-	for _, k := range kinds {
-		args = append(args, k)
-	}
-	args = append(args, limit)
-	rows, err := s.db.Query(`
+	query := `
 		SELECT f.path, f.rel_path, r.line, r.name
 		FROM refs r JOIN files f ON r.file_id = f.id
-		WHERE r.name = ? AND r.language = ? AND r.kind IN (`+kindPlaceholders+`)
-		ORDER BY f.rel_path, r.line
-		LIMIT ?
-	`, args...)
+		WHERE r.name = ? AND r.language IN (` + langPh + `)`
+	if len(kinds) > 0 {
+		kindPh := strings.Repeat("?,", len(kinds))
+		kindPh = kindPh[:len(kindPh)-1]
+		query += " AND r.kind IN (" + kindPh + ")"
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	query += " ORDER BY f.rel_path, r.line LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1510,6 +1506,10 @@ type TraceResult struct {
 	RelPath string `json:"rel_path"` // relative path
 	Line    int    `json:"line"`     // line of the call
 	Depth   int    `json:"depth"`    // hop distance from root
+	// Language is the caller's language (the file where the call occurs). It
+	// is used internally for language-aware graph resolution and is not
+	// serialized.
+	Language string `json:"-"`
 }
 
 // TraceOptions controls FindTrace behavior beyond the positional arguments.
@@ -1524,6 +1524,9 @@ type TraceOptions struct {
 	// --include-unresolved produces a bounded list. Has no effect unless
 	// IncludeUnresolved is also true.
 	UnresolvedExemptFromLimit bool
+	// Scope controls which languages a callee may resolve to relative to its
+	// caller. Empty defaults to ResolveScopeFamily (see NormalizeScope).
+	Scope ResolveScope
 }
 
 // FindTrace performs downward call graph traversal using BFS.
@@ -1557,14 +1560,30 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 		file      string
 		startLine int
 		endLine   int
+		language  string
 	}
 
-	resolveSymbol := func(name string) []symLoc {
-		rows, err := s.db.Query(`
-			SELECT s.name, f.path, s.start_line, s.end_line
+	// resolveSymbol finds indexed symbols by name. When scopeLangs is non-empty
+	// it constrains by language, so a callee only resolves to a symbol whose
+	// language is in the caller's resolution scope. This cuts cross-language
+	// name collisions in cymbal's name-only ref model — e.g. a Go String() call
+	// no longer resolves to a Python class named String — while still admitting
+	// interop within a language family (see ResolveScope / lang.Family).
+	resolveSymbol := func(name string, scopeLangs []string) []symLoc {
+		query := `
+			SELECT s.name, f.path, s.start_line, s.end_line, s.language
 			FROM symbols s JOIN files f ON s.file_id = f.id
-			WHERE s.name = ?
-		`, name)
+			WHERE s.name = ?`
+		args := []interface{}{name}
+		if len(scopeLangs) > 0 {
+			placeholders := strings.Repeat("?,", len(scopeLangs))
+			placeholders = placeholders[:len(placeholders)-1]
+			query += " AND s.language IN (" + placeholders + ")"
+			for _, l := range scopeLangs {
+				args = append(args, l)
+			}
+		}
+		rows, err := s.db.Query(query, args...)
 		if err != nil {
 			return nil
 		}
@@ -1572,7 +1591,7 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 		var locs []symLoc
 		for rows.Next() {
 			var loc symLoc
-			if err := rows.Scan(&loc.name, &loc.file, &loc.startLine, &loc.endLine); err != nil {
+			if err := rows.Scan(&loc.name, &loc.file, &loc.startLine, &loc.endLine, &loc.language); err != nil {
 				continue
 			}
 			locs = append(locs, loc)
@@ -1603,6 +1622,7 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 				continue
 			}
 			tr.Caller = loc.name
+			tr.Language = loc.language
 			results = append(results, tr)
 		}
 		return results
@@ -1614,7 +1634,9 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 	// len(results) unless unresolved rows are exempted (see TraceOptions),
 	// in which case only resolved rows count toward limit.
 	limited := 0
-	currentLocs := resolveSymbol(symbolName)
+	// The seed is resolved across all languages; callees are then constrained
+	// to their caller's resolution scope below.
+	currentLocs := resolveSymbol(symbolName, nil)
 
 	for d := 1; d <= depth && len(currentLocs) > 0 && limited < limit; d++ {
 		var nextLocs []symLoc
@@ -1633,9 +1655,10 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 					continue
 				}
 
-				// Resolve the callee — if it doesn't exist in the index,
-				// it's external (stdlib, third-party, or builtin).
-				nextSymLocs := resolveSymbol(tr.Callee)
+				// Resolve the callee within the caller's resolution scope — if
+				// it doesn't resolve, it's external (stdlib, third-party,
+				// builtin) or an out-of-scope cross-language name collision.
+				nextSymLocs := resolveSymbol(tr.Callee, scopeLanguages(loc.language, opts.Scope))
 				resolved := len(nextSymLocs) > 0
 				if !resolved && !opts.IncludeUnresolved {
 					continue
@@ -1667,21 +1690,60 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 	return results, nil
 }
 
-// FindImpact performs transitive caller analysis using BFS.
-func (s *Store) FindImpact(symbolName string, depth, limit int) ([]ImpactResult, error) {
-	return s.FindImpactScoped(symbolName, "", depth, limit)
+// SymbolLanguages returns the distinct languages of indexed symbols with the
+// given name. Used to derive a resolution scope for a seed symbol whose
+// language isn't already known to the caller.
+func (s *Store) SymbolLanguages(name string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT language FROM symbols WHERE name = ?`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var langs []string
+	for rows.Next() {
+		var l string
+		if err := rows.Scan(&l); err != nil {
+			continue
+		}
+		langs = append(langs, l)
+	}
+	return langs, rows.Err()
 }
 
-// FindImpactScoped is FindImpact with a language filter. When language is
-// non-empty, only refs and enclosing-symbols from files in that language are
-// followed — used by investigate to keep cross-language same-name symbols
-// from polluting transitive caller chains.
+// FindImpact performs transitive caller analysis using BFS, unrestricted by
+// language.
+func (s *Store) FindImpact(symbolName string, depth, limit int) ([]ImpactResult, error) {
+	return s.FindImpactInLangs(symbolName, nil, depth, limit)
+}
+
+// FindImpactScoped is FindImpact restricted to a single language. Retained for
+// back-compat; prefer FindImpactInLangs for family/scope-aware callers.
 func (s *Store) FindImpactScoped(symbolName, language string, depth, limit int) ([]ImpactResult, error) {
+	var langs []string
+	if language != "" {
+		langs = []string{language}
+	}
+	return s.FindImpactInLangs(symbolName, langs, depth, limit)
+}
+
+// FindImpactInLangs is FindImpact with a language-set filter. When langs is
+// non-empty, only refs and enclosing-symbols from files in those languages are
+// followed — used to keep cross-language same-name symbols from polluting
+// transitive caller chains while still admitting interop within a family.
+// A nil/empty langs set applies no restriction.
+func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limit int) ([]ImpactResult, error) {
 	if depth <= 0 {
 		depth = 2
 	}
 	if depth > 5 {
 		depth = 5
+	}
+
+	langFilter := ""
+	if len(langs) > 0 {
+		placeholders := strings.Repeat("?,", len(langs))
+		placeholders = placeholders[:len(placeholders)-1]
+		langFilter = " AND r.language IN (" + placeholders + ")"
 	}
 
 	seen := make(map[string]bool)
@@ -1691,21 +1753,14 @@ func (s *Store) FindImpactScoped(symbolName, language string, depth, limit int) 
 	for d := 1; d <= depth && len(currentSymbols) > 0 && len(results) < limit; d++ {
 		var nextSymbols []string
 		for _, sym := range currentSymbols {
-			var rows *sql.Rows
-			var err error
-			if language == "" {
-				rows, err = s.db.Query(`
-					SELECT f.path, f.rel_path, r.line, r.name
-					FROM refs r JOIN files f ON r.file_id = f.id
-					WHERE r.name = ?
-				`, sym)
-			} else {
-				rows, err = s.db.Query(`
-					SELECT f.path, f.rel_path, r.line, r.name
-					FROM refs r JOIN files f ON r.file_id = f.id
-					WHERE r.name = ? AND r.language = ?
-				`, sym, language)
+			args := []interface{}{sym}
+			for _, l := range langs {
+				args = append(args, l)
 			}
+			rows, err := s.db.Query(`
+				SELECT f.path, f.rel_path, r.line, r.name
+				FROM refs r JOIN files f ON r.file_id = f.id
+				WHERE r.name = ?`+langFilter, args...)
 			if err != nil {
 				continue
 			}

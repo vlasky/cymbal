@@ -419,3 +419,177 @@ func TestFindTraceUnresolvedExemptFromLimit(t *testing.T) {
 		t.Fatalf("resolved traversal (mid->leaf) must survive unresolved fan-out under exemption, got %+v", rows)
 	}
 }
+
+// TestFindTraceResolvesCalleesWithinCallerLanguage verifies that a callee only
+// resolves to a symbol in the caller's own language, so a same-named symbol in
+// a different language doesn't get followed (cross-language collision).
+func TestFindTraceResolvesCalleesWithinCallerLanguage(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	goID, err := store.UpsertFile("/repo/a.go", "a.go", "go", "h1", now, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pyID, err := store.UpsertFile("/repo/b.py", "b.py", "python", "h2", now, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Go caller 'load'; a same-named callee 'Render' exists only in Python.
+	if err := store.InsertSymbols(goID, []symbols.Symbol{
+		{Name: "load", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 10, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertSymbols(pyID, []symbols.Symbol{
+		{Name: "Render", Kind: "function", File: "/repo/b.py", StartLine: 1, EndLine: 10, Language: "python"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(goID, []symbols.Ref{
+		{Name: "Render", Line: 3, Language: "go", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The Go call to Render must not resolve to the Python symbol, so by
+	// default (unresolved filtered) it is dropped.
+	def, err := store.FindTrace("load", 2, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range def {
+		if tr.Callee == "Render" {
+			t.Fatalf("cross-language Render must not resolve to the Python symbol, got %+v", def)
+		}
+	}
+
+	// Add a Go 'Render': now the call resolves within language and surfaces.
+	if err := store.InsertSymbols(goID, []symbols.Symbol{
+		{Name: "Render", Kind: "function", File: "/repo/a.go", StartLine: 12, EndLine: 20, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	def2, err := store.FindTrace("load", 2, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawRender bool
+	for _, tr := range def2 {
+		if tr.Callee == "Render" {
+			sawRender = true
+		}
+	}
+	if !sawRender {
+		t.Fatalf("same-language Render should resolve and surface, got %+v", def2)
+	}
+}
+
+// TestFindTraceResolveScopeModes covers the three resolution scopes against a
+// cross-language interop call (Kotlin -> Java, same JVM family).
+func TestFindTraceResolveScopeModes(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	ktID, err := store.UpsertFile("/repo/a.kt", "a.kt", "kotlin", "h1", now, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	javaID, err := store.UpsertFile("/repo/B.java", "B.java", "java", "h2", now, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertSymbols(ktID, []symbols.Symbol{
+		{Name: "load", Kind: "function", File: "/repo/a.kt", StartLine: 1, EndLine: 10, Language: "kotlin"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertSymbols(javaID, []symbols.Symbol{
+		{Name: "Helper", Kind: "method", File: "/repo/B.java", StartLine: 1, EndLine: 10, Language: "java"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(ktID, []symbols.Ref{
+		{Name: "Helper", Line: 3, Language: "kotlin", Kind: symbols.RefKindCall},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	has := func(rows []TraceResult, name string) bool {
+		for _, r := range rows {
+			if r.Callee == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// family (default): kotlin and java share the JVM family, so the call resolves.
+	fam, err := store.FindTraceWithOptions("load", 2, 50, TraceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has(fam, "Helper") {
+		t.Fatalf("family scope should resolve kotlin->java Helper, got %+v", fam)
+	}
+
+	// same: exact-language only, so the java callee is out of scope.
+	same, err := store.FindTraceWithOptions("load", 2, 50, TraceOptions{Scope: ResolveScopeSame})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has(same, "Helper") {
+		t.Fatalf("same scope should not resolve kotlin->java Helper, got %+v", same)
+	}
+
+	// all: no language restriction.
+	all, err := store.FindTraceWithOptions("load", 2, 50, TraceOptions{Scope: ResolveScopeAll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has(all, "Helper") {
+		t.Fatalf("all scope should resolve Helper, got %+v", all)
+	}
+}
+
+// TestFindImpactInLangsFamily verifies impact follows callers across an interop
+// family but not outside the scope.
+func TestFindImpactInLangsFamily(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	javaID, _ := store.UpsertFile("/repo/Base.java", "Base.java", "java", "h1", now, 80)
+	ktID, _ := store.UpsertFile("/repo/use.kt", "use.kt", "kotlin", "h2", now, 80)
+	_ = store.InsertSymbols(javaID, []symbols.Symbol{{Name: "Base", Kind: "class", File: "/repo/Base.java", StartLine: 1, EndLine: 10, Language: "java"}})
+	_ = store.InsertSymbols(ktID, []symbols.Symbol{{Name: "useBase", Kind: "function", File: "/repo/use.kt", StartLine: 1, EndLine: 10, Language: "kotlin"}})
+	// A Kotlin file references the Java symbol Base from inside useBase().
+	_ = store.InsertRefs(ktID, []symbols.Ref{{Name: "Base", Line: 3, Language: "kotlin", Kind: symbols.RefKindCall}})
+
+	hasCaller := func(rows []ImpactResult, name string) bool {
+		for _, r := range rows {
+			if r.Caller == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// family: java's family includes kotlin, so the kotlin caller surfaces.
+	fam, err := store.FindImpactInLangs("Base", scopeLanguages("java", ResolveScopeFamily), 2, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCaller(fam, "useBase") {
+		t.Fatalf("family impact should include the kotlin caller, got %+v", fam)
+	}
+
+	// java-only: the kotlin ref is out of scope, so no caller is followed.
+	same, err := store.FindImpactInLangs("Base", []string{"java"}, 2, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasCaller(same, "useBase") {
+		t.Fatalf("java-only impact should exclude the kotlin caller, got %+v", same)
+	}
+}

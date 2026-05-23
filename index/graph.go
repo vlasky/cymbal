@@ -45,7 +45,13 @@ const (
 )
 
 const (
+	// GraphUnresolvedExternal: the callee resolves to no indexed symbol in any
+	// language (stdlib, third-party, or builtin).
 	GraphUnresolvedExternal GraphUnresolvedReason = "external"
+	// GraphUnresolvedScopeFiltered: the callee name exists in the index but
+	// only in a language outside the active resolution scope. Re-run with
+	// --resolve-scope all to traverse it.
+	GraphUnresolvedScopeFiltered GraphUnresolvedReason = "scope_filtered"
 )
 
 type GraphQuery struct {
@@ -55,6 +61,9 @@ type GraphQuery struct {
 	Scope             []string
 	Exclude           []string
 	IncludeUnresolved bool
+	// ResolveScope controls cross-language callee resolution (down/trace
+	// direction). Empty defaults to ResolveScopeFamily (see NormalizeScope).
+	ResolveScope ResolveScope
 	// Limit caps the graph at the top-N nodes by degree (edges touching
 	// the node). When >0 and the graph exceeds Limit, nodes are sorted
 	// by degree desc (stable tie-break: node ID asc), truncated, and a
@@ -103,10 +112,31 @@ type graphSymbolMeta struct {
 
 type graphBuilder struct {
 	q          GraphQuery
-	metas      map[string]graphSymbolMeta
+	metas      map[string][]graphSymbolMeta
 	nodes      map[string]GraphNode
 	edges      map[string]GraphEdge
 	unresolved map[string]GraphUnresolved
+}
+
+// lookupMeta resolves a symbol name to its metadata. When scopeLangs is
+// non-empty it returns the first entry whose language is in the set, so the
+// graph classifies cross-language name collisions consistently with FindTrace:
+// a name that exists only outside the scope is not resolved here, avoiding a
+// spurious resolved edge. With an empty set it falls back to the first entry.
+func (b *graphBuilder) lookupMeta(name string, scopeLangs []string) (graphSymbolMeta, bool) {
+	metas := b.metas[name]
+	if len(metas) == 0 {
+		return graphSymbolMeta{}, false
+	}
+	if len(scopeLangs) > 0 {
+		for _, m := range metas {
+			if inLangs(m.language, scopeLangs) {
+				return m, true
+			}
+		}
+		return graphSymbolMeta{}, false
+	}
+	return metas[0], true
 }
 
 func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
@@ -130,6 +160,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{
 			IncludeUnresolved:         true,
 			UnresolvedExemptFromLimit: true,
+			Scope:                     q.ResolveScope,
 		})
 		if err != nil {
 			return nil, err
@@ -138,7 +169,15 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 	}
 
 	if graphDirectionIncludesUp(q.Direction) {
-		rows, err := s.FindImpact(q.Symbol, q.Depth, 1000)
+		// Scope the upward caller traversal by the seed's language family so
+		// impact --graph matches the scoped impact text output.
+		var langs []string
+		if NormalizeScope(q.ResolveScope) != ResolveScopeAll {
+			if seedLangs, err := s.SymbolLanguages(q.Symbol); err == nil {
+				langs = scopeLanguagesUnion(seedLangs, q.ResolveScope)
+			}
+		}
+		rows, err := s.FindImpactInLangs(q.Symbol, langs, q.Depth, 1000)
 		if err != nil {
 			return nil, err
 		}
@@ -174,7 +213,7 @@ func emptyGraphResult() *GraphResult {
 	}
 }
 
-func newGraphBuilder(q GraphQuery, metas map[string]graphSymbolMeta) *graphBuilder {
+func newGraphBuilder(q GraphQuery, metas map[string][]graphSymbolMeta) *graphBuilder {
 	return &graphBuilder{
 		q:          q,
 		metas:      metas,
@@ -215,14 +254,24 @@ func (b *graphBuilder) addTraceRows(rows []TraceResult) {
 }
 
 func (b *graphBuilder) addTraceRow(row TraceResult) {
-	fromMeta := b.metas[row.Caller]
+	fromMeta, _ := b.lookupMeta(row.Caller, nil)
 	if !b.includeSymbol(row.Caller, fromMeta) {
 		return
 	}
 	fromID := b.addNode(row.Caller, fromMeta, GraphNodeKindSymbol)
-	toMeta, ok := b.metas[row.Callee]
+	// Resolve the callee within the caller's resolution scope so a same-named
+	// symbol outside the scope doesn't yield a spurious resolved edge.
+	scopeLangs := scopeLanguages(row.Language, b.q.ResolveScope)
+	toMeta, ok := b.lookupMeta(row.Callee, scopeLangs)
 	if !ok {
-		b.addUnresolvedEdge(fromID, row.Callee, "ext:"+row.Callee)
+		// Distinguish an out-of-scope name collision (exists in another
+		// language) from a genuinely external callee, so agents can tell why
+		// no edge was drawn and re-run with --resolve-scope all if needed.
+		reason := GraphUnresolvedExternal
+		if _, existsAnyLang := b.lookupMeta(row.Callee, nil); existsAnyLang {
+			reason = GraphUnresolvedScopeFiltered
+		}
+		b.addUnresolvedEdge(fromID, row.Callee, "ext:"+row.Callee, reason)
 		return
 	}
 	if b.includeSymbol(row.Callee, toMeta) {
@@ -238,8 +287,8 @@ func (b *graphBuilder) addImpactRows(rows []ImpactResult) {
 }
 
 func (b *graphBuilder) addImpactRow(row ImpactResult) {
-	fromMeta, ok := b.metas[row.Caller]
-	toMeta := b.metas[row.Symbol]
+	fromMeta, ok := b.lookupMeta(row.Caller, nil)
+	toMeta, _ := b.lookupMeta(row.Symbol, nil)
 	if !ok || !b.includeSymbol(row.Caller, fromMeta) || !b.includeSymbol(row.Symbol, toMeta) {
 		return
 	}
@@ -249,7 +298,7 @@ func (b *graphBuilder) addImpactRow(row ImpactResult) {
 }
 
 func (b *graphBuilder) addRoot() {
-	rootMeta, ok := b.metas[b.q.Symbol]
+	rootMeta, ok := b.lookupMeta(b.q.Symbol, nil)
 	if ok && b.includeSymbol(b.q.Symbol, rootMeta) {
 		b.addNode(b.q.Symbol, rootMeta, GraphNodeKindSymbol)
 	}
@@ -306,12 +355,12 @@ func (b *graphBuilder) addResolvedEdge(from, to string) {
 	b.edges[key] = GraphEdge{From: from, To: to, Kind: GraphEdgeKindCall, Resolved: true}
 }
 
-func (b *graphBuilder) addUnresolvedEdge(fromID, key, resolvedAs string) {
+func (b *graphBuilder) addUnresolvedEdge(fromID, key, resolvedAs string, reason GraphUnresolvedReason) {
 	ukey := fromID + "|" + resolvedAs
 	if _, ok := b.unresolved[ukey]; ok {
 		return
 	}
-	u := GraphUnresolved{From: fromID, Key: key, Reason: GraphUnresolvedExternal, ResolvedAs: resolvedAs}
+	u := GraphUnresolved{From: fromID, Key: key, Reason: reason, ResolvedAs: resolvedAs}
 	if b.q.IncludeUnresolved {
 		u.To = b.addExternal(resolvedAs)
 		b.edges[ukey] = GraphEdge{From: fromID, To: u.To, Kind: GraphEdgeKindCall, Resolved: false}
@@ -396,7 +445,7 @@ func truncateByDegree(g *GraphResult, limit int, rootID string) *GraphResult {
 	}
 }
 
-func (s *Store) symbolMetas() (map[string]graphSymbolMeta, error) {
+func (s *Store) symbolMetas() (map[string][]graphSymbolMeta, error) {
 	rows, err := s.db.Query(`
 		SELECT s.name, f.rel_path, s.language
 		FROM symbols s
@@ -408,16 +457,25 @@ func (s *Store) symbolMetas() (map[string]graphSymbolMeta, error) {
 	}
 	defer rows.Close()
 
-	out := map[string]graphSymbolMeta{}
+	out := map[string][]graphSymbolMeta{}
 	for rows.Next() {
 		var name, relPath, language string
 		if err := rows.Scan(&name, &relPath, &language); err != nil {
 			continue
 		}
-		if _, ok := out[name]; ok {
-			continue
+		meta := graphSymbolMeta{path: filepath.ToSlash(relPath), language: language}
+		// Keep distinct languages/paths per name so callee resolution can
+		// match by language; drop exact duplicates (e.g. worktree dupes).
+		dup := false
+		for _, m := range out[name] {
+			if m.language == meta.language && m.path == meta.path {
+				dup = true
+				break
+			}
 		}
-		out[name] = graphSymbolMeta{path: filepath.ToSlash(relPath), language: language}
+		if !dup {
+			out[name] = append(out[name], meta)
+		}
 	}
 	return out, rows.Err()
 }
