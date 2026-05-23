@@ -31,7 +31,10 @@ Examples:
 		depth, _ := cmd.Flags().GetInt("depth")
 		limit, _ := cmd.Flags().GetInt("limit")
 		ctx, _ := cmd.Flags().GetInt("context")
-		scope := resolveScopeFlag(cmd)
+		scope, err := resolveScopeOrError(cmd)
+		if err != nil {
+			return err
+		}
 
 		names, err := collectSymbols(cmd, args)
 		if err != nil {
@@ -63,25 +66,23 @@ Examples:
 
 		if jsonOut {
 			enriched := enrichImpact(merged, ctx)
-			// Attach hit_symbols attribution by returning a wrapper shape when
-			// multi-symbol. Single-symbol JSON is unchanged.
-			if len(names) > 1 {
-				out := make([]map[string]any, 0, len(enriched))
-				for i, row := range enriched {
-					key := impactKey(merged[i])
-					// enrichImpact returns values we rewrap; preserve its shape.
-					m := map[string]any{"row": row, "hit_symbols": sourceMap[key]}
-					out = append(out, m)
-				}
-				return writeJSON(map[string]any{
-					"symbols":       names,
-					"total_callers": len(merged),
-					"raw_rows":      totalRaw,
-					"resolve_scope": string(scope),
-					"results":       out,
+			// One object shape for any symbol count. Each result carries
+			// hit_symbols attribution (which requested symbols brought the
+			// caller in); for a single symbol that's just that symbol.
+			out := make([]map[string]any, 0, len(enriched))
+			for i, row := range enriched {
+				out = append(out, map[string]any{
+					"row":         row,
+					"hit_symbols": sourceMap[impactKey(merged[i])],
 				})
 			}
-			return writeJSON(enriched)
+			return writeJSON(map[string]any{
+				"symbols":       names,
+				"total_callers": len(merged),
+				"raw_rows":      totalRaw,
+				"resolve_scope": string(scope),
+				"results":       out,
+			})
 		}
 
 		// Group by depth.

@@ -105,8 +105,8 @@ func NewRegistry(langs ...Language) *Registry {
 }
 
 // Family returns the language names that interoperate with name, including
-// name itself, sorted. Languages with no declared interop family return just
-// [name]. An unknown or empty name returns nil.
+// name itself, sorted. Languages with no declared interop family — and names
+// not in the registry — return just [name]. Only an empty name returns nil.
 func (r *Registry) Family(name string) []string {
 	if name == "" {
 		return nil

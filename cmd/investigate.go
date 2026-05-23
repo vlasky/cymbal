@@ -35,7 +35,10 @@ Examples:
 		plan := resolveDBs(cmd)
 		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
-		scope := resolveScopeFlag(cmd)
+		scope, err := resolveScopeOrError(cmd)
+		if err != nil {
+			return err
+		}
 
 		if jsonOut && len(args) > 1 {
 			var all []any

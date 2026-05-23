@@ -1152,8 +1152,9 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 // FindImpactWithScope is FindImpact constrained to a resolution scope. It
 // derives the scope from the seed symbol's indexed language(s): callers are
 // followed only through refs in those languages (family-expanded by default).
-// With ResolveScopeAll, an unknown seed, or a seed spanning languages that
-// can't be jointly scoped, it is unrestricted.
+// A seed spanning multiple languages uses the union of their families. With
+// ResolveScopeAll, or when the seed has no indexed language to scope from, it
+// is unrestricted.
 func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int) ([]ImpactResult, error) {
 	if limit <= 0 {
 		limit = 100

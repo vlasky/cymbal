@@ -36,13 +36,31 @@ func addResolveScopeFlag(cmd *cobra.Command) {
 
 // resolveScopeFlag reads --resolve-scope, normalizing empty/unknown values to
 // the family default. Safe to call on verbs that didn't register the flag
-// (returns the family default).
+// (returns the family default). Used on the graph render path after the verb's
+// RunE has already validated user input via resolveScopeOrError.
 func resolveScopeFlag(cmd *cobra.Command) index.ResolveScope {
 	if cmd.Flags().Lookup("resolve-scope") == nil {
 		return index.ResolveScopeFamily
 	}
 	raw, _ := cmd.Flags().GetString("resolve-scope")
 	return index.NormalizeScope(index.ResolveScope(strings.TrimSpace(raw)))
+}
+
+// resolveScopeOrError reads --resolve-scope and rejects unknown values, so an
+// agent passing a typo gets a clear error rather than a silent family default.
+// Verbs that didn't register the flag get the family default.
+func resolveScopeOrError(cmd *cobra.Command) (index.ResolveScope, error) {
+	if cmd.Flags().Lookup("resolve-scope") == nil {
+		return index.ResolveScopeFamily, nil
+	}
+	raw, _ := cmd.Flags().GetString("resolve-scope")
+	scope := index.ResolveScope(strings.TrimSpace(raw))
+	switch scope {
+	case index.ResolveScopeSame, index.ResolveScopeFamily, index.ResolveScopeAll:
+		return scope, nil
+	default:
+		return "", fmt.Errorf("invalid --resolve-scope %q: want one of same, family, all", raw)
+	}
 }
 
 // graphRequested reports whether the user asked for graph output on a verb
@@ -145,6 +163,12 @@ func renderPreparedGraph(cmd *cobra.Command, graph *index.GraphResult, rootIDs m
 	format := selectGraphFormatFromVerb(cmd)
 	userLimit, _ := cmd.Flags().GetInt("graph-limit")
 	graph = applyGraphLimit(graph, userLimit, format, rootIDs)
+	// Surface the active resolution scope on verbs that support it (trace,
+	// impact); set after merge/limit so it isn't dropped. Verbs without the
+	// flag (importers, impls) leave it empty.
+	if cmd.Flags().Lookup("resolve-scope") != nil {
+		graph.ResolveScope = resolveScopeFlag(cmd)
+	}
 	return renderGraph(format, graph)
 }
 

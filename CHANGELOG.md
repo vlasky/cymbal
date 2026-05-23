@@ -4,6 +4,15 @@ All notable changes to cymbal are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-language resolution scope for `trace` / `impact` / `investigate`** — cymbal resolves references by name only (no receiver/type/import resolution), so a call could mis-resolve to a same-named symbol in an unrelated language. A new `--resolve-scope` flag (`same` | `family` | `all`, default `family`) constrains which languages a name resolves to, defaulting to the caller/seed's interop family so legitimate cross-language calls still resolve. Families: `jvm` (java/kotlin/scala), `js` (javascript/typescript/tsx), `c` (c/cpp); every other language scopes to itself. In `--graph` mode, an out-of-scope name collision is surfaced as a new `scope_filtered` entry in the `unresolved` diagnostics list (distinct from `external`), so the reason no edge was drawn is explicit. The active scope is reported as `resolve_scope` in frontmatter and JSON. An unknown `--resolve-scope` value is a hard error.
+- **`trace` filters unresolved callees by default** — callees that don't resolve to an indexed symbol (stdlib, third-party, builtins) are dropped by default; pass `--include-unresolved` to keep them in text/JSON (and as dashed `ext:` nodes in `--graph`). Graph mode still records all unresolved callees in the `unresolved` diagnostics list regardless.
+
+### Changed
+
+- **BREAKING: single-symbol `trace --json` / `impact --json` now return the same object shape as multi-symbol** — previously a single symbol emitted a bare JSON array while multiple symbols emitted `{symbols, …, results}`. Both now emit the object form (`{symbols, …, resolve_scope, results: [{row, hit_symbols}]}`), so agent consumers parse one consistent shape regardless of symbol count. Scripts that parsed the top-level array must read `.results[].row` instead.
+
 ### Fixed
 
 - **OpenCode hook installs now target the plugin directory OpenCode actually loads** — user-scope `cymbal hook install opencode` now writes to `~/.config/opencode/plugins/cymbal-opencode.js` instead of the Windows-native `%APPDATA%\opencode\plugins` path that OpenCode 1.15.9 ignores. The installer also honors `OPENCODE_CONFIG_DIR` by writing to `$OPENCODE_CONFIG_DIR/plugins/cymbal-opencode.js`, matching OpenCode's custom config directory behavior.
