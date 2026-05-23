@@ -45,11 +45,13 @@ var Default = NewRegistry(
 		Name:       "javascript",
 		Extensions: []string{".js", ".jsx", ".mjs", ".cjs"},
 		TreeSitter: sitter.NewLanguage(tsjavascript.Language()),
+		Family:     "js",
 	},
 	Language{
 		Name:       "typescript",
 		Extensions: []string{".ts", ".mts", ".cts"},
 		TreeSitter: sitter.NewLanguage(tstypescript.LanguageTypescript()),
+		Family:     "js",
 	},
 	Language{
 		// .tsx uses the TSX grammar so JSX parses natively. Without this split,
@@ -58,6 +60,7 @@ var Default = NewRegistry(
 		Name:       "tsx",
 		Extensions: []string{".tsx"},
 		TreeSitter: sitter.NewLanguage(tstypescript.LanguageTSX()),
+		Family:     "js",
 	},
 	Language{
 		Name:       "rust",
@@ -73,16 +76,19 @@ var Default = NewRegistry(
 		Name:       "java",
 		Extensions: []string{".java"},
 		TreeSitter: sitter.NewLanguage(tsjava.Language()),
+		Family:     "jvm",
 	},
 	Language{
 		Name:       "c",
 		Extensions: []string{".c", ".h"},
 		TreeSitter: sitter.NewLanguage(tsc.Language()),
+		Family:     "c",
 	},
 	Language{
 		Name:       "cpp",
 		Extensions: []string{".cpp", ".cc", ".hpp", ".cxx", ".hxx", ".hh"},
 		TreeSitter: sitter.NewLanguage(tscpp.Language()),
+		Family:     "c",
 	},
 	Language{
 		Name:       "csharp",
@@ -103,6 +109,7 @@ var Default = NewRegistry(
 		Name:       "kotlin",
 		Extensions: []string{".kt", ".kts"},
 		TreeSitter: sitter.NewLanguage(tskotlin.Language()),
+		Family:     "jvm",
 	},
 	Language{
 		Name:       "lua",
@@ -123,6 +130,7 @@ var Default = NewRegistry(
 		Name:       "scala",
 		Extensions: []string{".scala", ".sc"},
 		TreeSitter: sitter.NewLanguage(tsscala.Language()),
+		Family:     "jvm",
 	},
 	Language{
 		Name:       "yaml",
