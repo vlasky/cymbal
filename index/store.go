@@ -1514,7 +1514,16 @@ type TraceResult struct {
 
 // TraceOptions controls FindTrace behavior beyond the positional arguments.
 type TraceOptions struct {
-	IncludeUnresolved bool // include callees that don't resolve to any indexed symbol
+	// IncludeUnresolved includes callees that don't resolve to any indexed
+	// symbol (stdlib, third-party, builtins) in the results.
+	IncludeUnresolved bool
+	// UnresolvedExemptFromLimit keeps unresolved (terminal) callees from
+	// consuming the result limit. The graph builder sets this so a flood of
+	// external calls can't crowd out resolved traversal breadth while still
+	// collecting unresolved diagnostics; CLI trace leaves it false so
+	// --include-unresolved produces a bounded list. Has no effect unless
+	// IncludeUnresolved is also true.
+	UnresolvedExemptFromLimit bool
 }
 
 // FindTrace performs downward call graph traversal using BFS.
@@ -1601,9 +1610,13 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 
 	seen := make(map[string]bool)
 	var results []TraceResult
+	// limited counts results that consume the limit budget. It equals
+	// len(results) unless unresolved rows are exempted (see TraceOptions),
+	// in which case only resolved rows count toward limit.
+	limited := 0
 	currentLocs := resolveSymbol(symbolName)
 
-	for d := 1; d <= depth && len(currentLocs) > 0 && len(results) < limit; d++ {
+	for d := 1; d <= depth && len(currentLocs) > 0 && limited < limit; d++ {
 		var nextLocs []symLoc
 		for _, loc := range currentLocs {
 			callees := calleesOf(loc)
@@ -1623,7 +1636,8 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 				// Resolve the callee — if it doesn't exist in the index,
 				// it's external (stdlib, third-party, or builtin).
 				nextSymLocs := resolveSymbol(tr.Callee)
-				if len(nextSymLocs) == 0 && !opts.IncludeUnresolved {
+				resolved := len(nextSymLocs) > 0
+				if !resolved && !opts.IncludeUnresolved {
 					continue
 				}
 
@@ -1631,12 +1645,19 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 				tr.Depth = d
 				results = append(results, tr)
 
+				// Only resolved callees expand the frontier; unresolved ones
+				// are terminal leaves (nextSymLocs is empty).
 				for _, nextLoc := range nextSymLocs {
 					nextLocs = append(nextLocs, nextLoc)
 				}
 
-				if len(results) >= limit {
-					return results, nil
+				// Unresolved leaves don't consume the budget when exempted, so
+				// they can't starve resolved traversal within the limit.
+				if resolved || !opts.UnresolvedExemptFromLimit {
+					limited++
+					if limited >= limit {
+						return results, nil
+					}
 				}
 			}
 		}

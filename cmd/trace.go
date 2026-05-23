@@ -21,6 +21,10 @@ what those call, etc. Complementary to impact (which traces upward).
 By default trace only follows invocation edges (ref kind=call). Use
 --kinds to include broader relationships (e.g. type mentions).
 
+Callees that don't resolve to an indexed symbol (stdlib, third-party, or
+builtins) are filtered out by default. Pass --include-unresolved to keep
+them in the text/JSON output (and as dashed ext: nodes in --graph mode).
+
 Multi-symbol: pass more than one name (or pipe via --stdin) to get the
 union of callees across all requested symbols. Shared callees are deduped
 and a hit_symbols attribution list records which of the requested symbols
@@ -31,6 +35,7 @@ Examples:
   cymbal trace handleRegister --depth 5           # deeper trace
   cymbal trace Save Load Delete                   # union of callees
   cymbal trace handleRegister --kinds call,use    # include identifier mentions
+  cymbal trace handleRegister --include-unresolved # keep stdlib/external calls
   cymbal outline svc.go -s --names | cymbal trace --stdin`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
