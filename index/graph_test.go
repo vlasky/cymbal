@@ -423,3 +423,138 @@ func TestBuildGraphAnnotatesAmbiguousNode(t *testing.T) {
 		t.Fatalf("unambiguous Root should have no annotation, got count=%d defs=%+v", root.DefinitionCount, root.Definitions)
 	}
 }
+
+// TestBuildGraphSameNameDefinitionSurvivesScopeFilter is the regression for the
+// scoped same-name collision: when a name has one definition that's excluded
+// and another that's in scope, the node must survive via the in-scope one
+// (previously the builder judged visibility off a single arbitrary definition
+// and could drop the node entirely).
+func TestBuildGraphSameNameDefinitionSurvivesScopeFilter(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	aID, _ := store.UpsertFile("/repo/a.go", "a.go", "go", "h0", now, 100)
+	// Two 'Dup' definitions; "excluded/..." sorts before "keep/..." in metas.
+	exID, _ := store.UpsertFile("/repo/excluded/dup.go", "excluded/dup.go", "go", "h1", now, 100)
+	keepID, _ := store.UpsertFile("/repo/keep/dup.go", "keep/dup.go", "go", "h2", now, 100)
+	_ = store.InsertSymbols(aID, []symbols.Symbol{{Name: "Entry", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 5, Language: "go"}})
+	_ = store.InsertSymbols(exID, []symbols.Symbol{{Name: "Dup", Kind: "function", File: "/repo/excluded/dup.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	_ = store.InsertSymbols(keepID, []symbols.Symbol{{Name: "Dup", Kind: "function", File: "/repo/keep/dup.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	_ = store.InsertRefs(aID, []symbols.Ref{{Name: "Dup", Line: 2, Language: "go", Kind: symbols.RefKindCall}})
+
+	g, err := store.BuildGraph(GraphQuery{
+		Symbol: "Entry", Direction: GraphDirectionDown, Depth: 3,
+		Exclude: []string{"excluded/*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var dup *GraphNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Symbol == "Dup" {
+			dup = &g.Nodes[i]
+		}
+	}
+	if dup == nil {
+		t.Fatalf("Dup node should survive via the non-excluded definition, got %+v", g.Nodes)
+	}
+	if dup.Path != "keep/dup.go" {
+		t.Fatalf("Dup node should display the in-scope definition keep/dup.go, got %q", dup.Path)
+	}
+	var edge bool
+	for _, e := range g.Edges {
+		if e.Resolved && e.To == graphNodeID("Dup") {
+			edge = true
+		}
+	}
+	if !edge {
+		t.Fatalf("expected resolved Entry->Dup edge, got %+v", g.Edges)
+	}
+}
+
+// TestBuildGraphSameNameSurvivesGraphScope is the --graph-scope counterpart to
+// the --exclude collision test: when the first-sorted definition is OUTSIDE the
+// scope but another is inside, the node must survive via the in-scope one.
+func TestBuildGraphSameNameSurvivesGraphScope(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	aID, _ := store.UpsertFile("/repo/a.go", "a.go", "go", "h0", now, 100)
+	// "aaa/dup.go" sorts before "keep/dup.go" but is out of --graph-scope.
+	outID, _ := store.UpsertFile("/repo/aaa/dup.go", "aaa/dup.go", "go", "h1", now, 100)
+	keepID, _ := store.UpsertFile("/repo/keep/dup.go", "keep/dup.go", "go", "h2", now, 100)
+	_ = store.InsertSymbols(aID, []symbols.Symbol{{Name: "Entry", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 5, Language: "go"}})
+	_ = store.InsertSymbols(outID, []symbols.Symbol{{Name: "Dup", Kind: "function", File: "/repo/aaa/dup.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	_ = store.InsertSymbols(keepID, []symbols.Symbol{{Name: "Dup", Kind: "function", File: "/repo/keep/dup.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	_ = store.InsertRefs(aID, []symbols.Ref{{Name: "Dup", Line: 2, Language: "go", Kind: symbols.RefKindCall}})
+
+	g, err := store.BuildGraph(GraphQuery{
+		Symbol: "Entry", Direction: GraphDirectionDown, Depth: 3,
+		Scope: []string{"a.go", "keep/*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dup *GraphNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Symbol == "Dup" {
+			dup = &g.Nodes[i]
+		}
+	}
+	if dup == nil || dup.Path != "keep/dup.go" {
+		t.Fatalf("Dup should survive via in-scope keep/dup.go, got %+v", g.Nodes)
+	}
+	var edge bool
+	for _, e := range g.Edges {
+		if e.Resolved && e.To == graphNodeID("Dup") {
+			edge = true
+		}
+	}
+	if !edge {
+		t.Fatalf("expected resolved Entry->Dup edge, got %+v", g.Edges)
+	}
+}
+
+// TestBuildGraphImpactSameNameCallerSurvivesExclude exercises the collision fix
+// on the impact (up) path: a caller name with one excluded and one in-scope
+// definition must still produce the caller->target edge via the in-scope one.
+func TestBuildGraphImpactSameNameCallerSurvivesExclude(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	aID, _ := store.UpsertFile("/repo/a.go", "a.go", "go", "h0", now, 100)
+	exID, _ := store.UpsertFile("/repo/excluded/caller.go", "excluded/caller.go", "go", "h1", now, 100)
+	keepID, _ := store.UpsertFile("/repo/keep/caller.go", "keep/caller.go", "go", "h2", now, 100)
+	_ = store.InsertSymbols(aID, []symbols.Symbol{{Name: "Target", Kind: "function", File: "/repo/a.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	// Two 'Caller' definitions; the in-scope one (keep/) actually calls Target.
+	_ = store.InsertSymbols(exID, []symbols.Symbol{{Name: "Caller", Kind: "function", File: "/repo/excluded/caller.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	_ = store.InsertSymbols(keepID, []symbols.Symbol{{Name: "Caller", Kind: "function", File: "/repo/keep/caller.go", StartLine: 1, EndLine: 3, Language: "go"}})
+	_ = store.InsertRefs(keepID, []symbols.Ref{{Name: "Target", Line: 2, Language: "go", Kind: symbols.RefKindCall}})
+
+	g, err := store.BuildGraph(GraphQuery{
+		Symbol: "Target", Direction: GraphDirectionUp, Depth: 2,
+		Exclude: []string{"excluded/*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var caller *GraphNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Symbol == "Caller" {
+			caller = &g.Nodes[i]
+		}
+	}
+	if caller == nil || caller.Path != "keep/caller.go" {
+		t.Fatalf("Caller should survive via in-scope keep/caller.go, got %+v", g.Nodes)
+	}
+	var edge bool
+	for _, e := range g.Edges {
+		if e.Resolved && e.From == graphNodeID("Caller") && e.To == graphNodeID("Target") {
+			edge = true
+		}
+	}
+	if !edge {
+		t.Fatalf("expected resolved Caller->Target impact edge, got %+v", g.Edges)
+	}
+}

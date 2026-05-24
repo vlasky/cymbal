@@ -18,6 +18,7 @@ All notable changes to cymbal are documented here.
 ### Fixed
 
 - **`--graph` no longer mislabels class-nested methods as external** — the graph builder's symbol metadata was restricted to top-level (`depth=0`) symbols, while `trace`/`impact` resolve against symbols at any depth. As a result, in class-based languages (Java, Python, TypeScript, …) a real method calling another method showed up in `trace --graph` / `impact --graph` as an `external` (stdlib/third-party) node with no resolved edge — even though `trace` text and `refs` correctly identified it. Graph metadata now covers all depths, so nested methods resolve as real nodes/edges. Go was largely unaffected (its functions/methods are top-level).
+- **`--graph` keeps a name that's in scope under one definition but excluded under another** — when a name had several definitions, `--graph-scope` / `--exclude` were judged against a single arbitrary definition, so a node could be dropped even when an in-scope definition existed. Visibility now considers every definition of the name and displays an in-scope one.
 
 ## [0.13.5] - 2026-05-19
 
