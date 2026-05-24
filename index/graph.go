@@ -136,25 +136,63 @@ type graphBuilder struct {
 	unresolved map[string]GraphUnresolved
 }
 
-// lookupMeta resolves a symbol name to its metadata. When scopeLangs is
-// non-empty it returns the first entry whose language is in the set, so the
-// graph classifies cross-language name collisions consistently with FindTrace:
-// a name that exists only outside the scope is not resolved here, avoiding a
-// spurious resolved edge. With an empty set it falls back to the first entry.
-func (b *graphBuilder) lookupMeta(name string, scopeLangs []string) (graphSymbolMeta, bool) {
+// metaVisible reports whether a definition's path passes the graph's
+// --graph-scope / --exclude globs. A path-less meta (e.g. a name with no
+// indexed definition) is treated as visible.
+func (b *graphBuilder) metaVisible(meta graphSymbolMeta) bool {
+	if meta.path == "" {
+		return true
+	}
+	if matchesAnyGlob(meta.path, b.q.Exclude) {
+		return false
+	}
+	if len(b.q.Scope) == 0 {
+		return true
+	}
+	return matchesAnyGlob(meta.path, b.q.Scope)
+}
+
+// classifyMeta inspects every indexed definition of name (restricted to
+// scopeLangs when non-empty) and reports three things, kept deliberately
+// separate:
+//
+//   - resolved: at least one definition matches the scope languages. This
+//     classifies cross-language collisions consistently with FindTrace (a name
+//     that exists only outside the scope is unresolved, not a spurious edge).
+//   - meta: the definition to display — a visible one when any matching
+//     definition is visible, otherwise the first scope-matching definition.
+//   - visible: at least one matching definition passes the scope/exclude globs.
+//
+// Resolution and visibility differ when a name resolves but every matching
+// definition is filtered by --exclude/--graph-scope: that yields no edge
+// (filtered out), not an external/scope_filtered diagnostic. Considering all
+// definitions — not just the first — is what fixes same-name collisions where
+// one definition is in scope and another is excluded.
+//
+// A name with no metadata is unresolved but path-less-visible, preserving the
+// prior behavior for call sites that gate only on visibility.
+func (b *graphBuilder) classifyMeta(name string, scopeLangs []string) (resolved bool, meta graphSymbolMeta, visible bool) {
 	metas := b.metas[name]
 	if len(metas) == 0 {
-		return graphSymbolMeta{}, false
+		return false, graphSymbolMeta{}, true
 	}
-	if len(scopeLangs) > 0 {
-		for _, m := range metas {
-			if inLangs(m.language, scopeLangs) {
-				return m, true
-			}
+	var firstScoped graphSymbolMeta
+	haveScoped := false
+	for _, m := range metas {
+		if len(scopeLangs) > 0 && !inLangs(m.language, scopeLangs) {
+			continue
 		}
-		return graphSymbolMeta{}, false
+		if !haveScoped {
+			firstScoped, haveScoped = m, true
+		}
+		if b.metaVisible(m) {
+			return true, m, true
+		}
 	}
-	return metas[0], true
+	if !haveScoped {
+		return false, graphSymbolMeta{}, false
+	}
+	return true, firstScoped, false
 }
 
 func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
@@ -275,27 +313,31 @@ func (b *graphBuilder) addTraceRows(rows []TraceResult) {
 }
 
 func (b *graphBuilder) addTraceRow(row TraceResult) {
-	fromMeta, _ := b.lookupMeta(row.Caller, nil)
-	if !b.includeSymbol(row.Caller, fromMeta) {
+	// The caller is drawn whenever it's visible (it's already a resolved
+	// trace symbol); an excluded/out-of-scope caller hard-cuts the row.
+	_, fromMeta, fromVisible := b.classifyMeta(row.Caller, nil)
+	if !fromVisible {
 		return
 	}
 	fromID := b.addNode(row.Caller, fromMeta, GraphNodeKindSymbol)
 	// Resolve the callee within the caller's resolution scope so a same-named
 	// symbol outside the scope doesn't yield a spurious resolved edge.
 	scopeLangs := scopeLanguages(row.Language, b.q.ResolveScope)
-	toMeta, ok := b.lookupMeta(row.Callee, scopeLangs)
-	if !ok {
+	resolved, toMeta, visible := b.classifyMeta(row.Callee, scopeLangs)
+	if !resolved {
 		// Distinguish an out-of-scope name collision (exists in another
 		// language) from a genuinely external callee, so agents can tell why
 		// no edge was drawn and re-run with --resolve-scope all if needed.
 		reason := GraphUnresolvedExternal
-		if _, existsAnyLang := b.lookupMeta(row.Callee, nil); existsAnyLang {
+		if len(b.metas[row.Callee]) > 0 {
 			reason = GraphUnresolvedScopeFiltered
 		}
 		b.addUnresolvedEdge(fromID, row.Callee, "ext:"+row.Callee, reason)
 		return
 	}
-	if b.includeSymbol(row.Callee, toMeta) {
+	// Resolved but every matching definition is filtered by scope/exclude:
+	// no edge (intentional filter), not an unresolved diagnostic.
+	if visible {
 		toID := b.addNode(row.Callee, toMeta, GraphNodeKindSymbol)
 		b.addResolvedEdge(fromID, toID)
 	}
@@ -308,9 +350,11 @@ func (b *graphBuilder) addImpactRows(rows []ImpactResult) {
 }
 
 func (b *graphBuilder) addImpactRow(row ImpactResult) {
-	fromMeta, ok := b.lookupMeta(row.Caller, nil)
-	toMeta, _ := b.lookupMeta(row.Symbol, nil)
-	if !ok || !b.includeSymbol(row.Caller, fromMeta) || !b.includeSymbol(row.Symbol, toMeta) {
+	// Caller must resolve and be visible; the target (already a resolved
+	// impact symbol) only needs to be visible.
+	fromResolved, fromMeta, fromVisible := b.classifyMeta(row.Caller, nil)
+	_, toMeta, toVisible := b.classifyMeta(row.Symbol, nil)
+	if !fromResolved || !fromVisible || !toVisible {
 		return
 	}
 	fromID := b.addNode(row.Caller, fromMeta, GraphNodeKindSymbol)
@@ -319,23 +363,10 @@ func (b *graphBuilder) addImpactRow(row ImpactResult) {
 }
 
 func (b *graphBuilder) addRoot() {
-	rootMeta, ok := b.lookupMeta(b.q.Symbol, nil)
-	if ok && b.includeSymbol(b.q.Symbol, rootMeta) {
+	resolved, rootMeta, visible := b.classifyMeta(b.q.Symbol, nil)
+	if resolved && visible {
 		b.addNode(b.q.Symbol, rootMeta, GraphNodeKindSymbol)
 	}
-}
-
-func (b *graphBuilder) includeSymbol(symbol string, meta graphSymbolMeta) bool {
-	if meta.path == "" {
-		return true
-	}
-	if matchesAnyGlob(meta.path, b.q.Exclude) {
-		return false
-	}
-	if len(b.q.Scope) == 0 {
-		return true
-	}
-	return matchesAnyGlob(meta.path, b.q.Scope)
 }
 
 func (b *graphBuilder) addNode(symbol string, meta graphSymbolMeta, kind GraphNodeKind) string {
@@ -493,8 +524,10 @@ func (s *Store) symbolMetas() (map[string][]graphSymbolMeta, error) {
 	// All depths, not just top-level: methods and other nested symbols are
 	// legitimate call-graph nodes, and trace/impact resolve against every
 	// depth — restricting metadata to depth 0 made the graph mislabel real
-	// nested methods as external. Deterministic ordering keeps the name-only
-	// metas[0] fallback stable (top-level first, then language/path/line).
+	// nested methods as external. Deterministic ordering (top-level first,
+	// then language/path/line) makes classifyMeta's selection stable: the
+	// first visible matching definition wins, and ambiguity annotations list
+	// the definitions in this order.
 	rows, err := s.db.Query(`
 		SELECT s.name, f.rel_path, s.language, s.start_line
 		FROM symbols s
