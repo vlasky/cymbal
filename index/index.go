@@ -1201,6 +1201,15 @@ func FindTraceWithOptions(dbPath, symbolName string, depth, limit int, opts Trac
 	return store.FindTraceWithOptions(symbolName, depth, limit, opts, kinds...)
 }
 
+// FindPath finds the shortest call chain between two symbols.
+func FindPath(dbPath, from, to string, depth int, opts TraceOptions) (*PathOutput, error) {
+	store, err := openCached(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return store.FindPath(from, to, depth, opts)
+}
+
 // BuildGraph renders symbol relationships as a graph from an opened DB.
 // Direction is up | down | both; see GraphQuery for full options.
 func BuildGraph(dbPath string, q GraphQuery) (*GraphResult, error) {

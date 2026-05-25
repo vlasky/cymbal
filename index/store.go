@@ -1804,3 +1804,212 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 
 	return results, nil
 }
+
+// PathResult represents one hop in a shortest path between two symbols.
+type PathResult struct {
+	Caller  string `json:"caller"`
+	Callee  string `json:"callee"`
+	File    string `json:"file"`
+	RelPath string `json:"rel_path"`
+	Line    int    `json:"line"`
+	Depth   int    `json:"depth"`
+}
+
+// PathStatus distinguishes why FindPath returned no path.
+type PathStatus int
+
+const (
+	// PathFound means a path was found.
+	PathFound PathStatus = iota
+	// PathNotReachable means the BFS exhausted the reachable graph — no
+	// path exists regardless of depth.
+	PathNotReachable
+	// PathDepthExhausted means the BFS hit the depth limit with frontier
+	// still remaining — a path may exist at greater depth.
+	PathDepthExhausted
+)
+
+// PathOutput is the result of FindPath.
+type PathOutput struct {
+	Path   []PathResult
+	Status PathStatus
+}
+
+// FindPath finds the shortest call chain from `from` to `to` using BFS.
+func (s *Store) FindPath(from, to string, depth int, opts TraceOptions) (*PathOutput, error) {
+	if depth <= 0 {
+		depth = 5
+	}
+
+	kinds := []string{symbols.RefKindCall}
+	kindPlaceholders := strings.Repeat("?,", len(kinds))
+	kindPlaceholders = kindPlaceholders[:len(kindPlaceholders)-1]
+
+	type symLoc struct {
+		name      string
+		file      string
+		startLine int
+		endLine   int
+		language  string
+	}
+
+	resolveSymbol := func(name string, scopeLangs []string) []symLoc {
+		query := `
+			SELECT s.name, f.path, s.start_line, s.end_line, s.language
+			FROM symbols s JOIN files f ON s.file_id = f.id
+			WHERE s.name = ?`
+		args := []interface{}{name}
+		if len(scopeLangs) > 0 {
+			placeholders := strings.Repeat("?,", len(scopeLangs))
+			placeholders = placeholders[:len(placeholders)-1]
+			query += " AND s.language IN (" + placeholders + ")"
+			for _, l := range scopeLangs {
+				args = append(args, l)
+			}
+		}
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		var locs []symLoc
+		for rows.Next() {
+			var loc symLoc
+			if err := rows.Scan(&loc.name, &loc.file, &loc.startLine, &loc.endLine, &loc.language); err != nil {
+				continue
+			}
+			locs = append(locs, loc)
+		}
+		return locs
+	}
+
+	calleesOf := func(loc symLoc) []struct {
+		name    string
+		file    string
+		relPath string
+		line    int
+	} {
+		args := []interface{}{loc.file, loc.startLine, loc.endLine}
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+		rows, err := s.db.Query(`
+			SELECT r.name, f.path, f.rel_path, r.line
+			FROM refs r JOIN files f ON r.file_id = f.id
+			WHERE f.path = ? AND r.line >= ? AND r.line <= ?
+			  AND r.kind IN (`+kindPlaceholders+`)
+		`, args...)
+		if err != nil {
+			return nil
+		}
+		defer rows.Close()
+		var results []struct {
+			name    string
+			file    string
+			relPath string
+			line    int
+		}
+		for rows.Next() {
+			var r struct {
+				name    string
+				file    string
+				relPath string
+				line    int
+			}
+			if err := rows.Scan(&r.name, &r.file, &r.relPath, &r.line); err != nil {
+				continue
+			}
+			results = append(results, r)
+		}
+		return results
+	}
+
+	type edge struct {
+		caller  string
+		callee  string
+		file    string
+		relPath string
+		line    int
+	}
+	parent := make(map[string]edge)
+	visited := make(map[string]bool)
+
+	startLocs := resolveSymbol(from, nil)
+	if len(startLocs) == 0 {
+		return nil, fmt.Errorf("symbol not found: %s", from)
+	}
+	targetLocs := resolveSymbol(to, nil)
+	if len(targetLocs) == 0 {
+		return nil, fmt.Errorf("symbol not found: %s", to)
+	}
+
+	if from == to {
+		return &PathOutput{Path: []PathResult{}, Status: PathFound}, nil
+	}
+
+	visited[from] = true
+	currentLocs := startLocs
+
+	for d := 1; d <= depth && len(currentLocs) > 0; d++ {
+		var nextLocs []symLoc
+		for _, loc := range currentLocs {
+			callees := calleesOf(loc)
+			for _, c := range callees {
+				if c.name == loc.name || len(c.name) <= 2 {
+					continue
+				}
+				if visited[c.name] {
+					continue
+				}
+
+				scopeLangs := scopeLanguages(loc.language, opts.Scope)
+				resolved := resolveSymbol(c.name, scopeLangs)
+				if len(resolved) == 0 {
+					continue
+				}
+
+				parent[c.name] = edge{
+					caller:  loc.name,
+					callee:  c.name,
+					file:    c.file,
+					relPath: c.relPath,
+					line:    c.line,
+				}
+				visited[c.name] = true
+
+				if c.name == to {
+					var path []PathResult
+					current := to
+					for current != from {
+						e := parent[current]
+						path = append(path, PathResult{
+							Caller:  e.caller,
+							Callee:  e.callee,
+							File:    e.file,
+							RelPath: e.relPath,
+							Line:    e.line,
+						})
+						current = e.caller
+					}
+					for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+						path[i], path[j] = path[j], path[i]
+					}
+					for i := range path {
+						path[i].Depth = i + 1
+					}
+					return &PathOutput{Path: path, Status: PathFound}, nil
+				}
+
+				nextLocs = append(nextLocs, resolved...)
+			}
+		}
+		currentLocs = nextLocs
+	}
+
+	// Distinguish: did we stop because frontier was empty (no path exists)
+	// or because we hit the depth limit (path may exist deeper)?
+	if len(currentLocs) == 0 {
+		return &PathOutput{Status: PathNotReachable}, nil
+	}
+	return &PathOutput{Status: PathDepthExhausted}, nil
+}
