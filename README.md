@@ -202,9 +202,10 @@ into fewer, more relevant tool calls with structured output.
 | `outline` | List symbols in a file |
 | `refs` | Find references / call sites. Use `--file` to scope by path |
 | `context` | Bundled view: source + types + callers + imports |
+| `index` | Build or refresh the repo index. Optional — queries auto-build on first use |
 | `ls` | File tree, repo list, or `--stats` overview |
 | `diff` | Git diff scoped to a symbol's line range |
-| `hook` | Agent-integration helpers: `nudge`, `remind`, `install <agent>` |
+| `hook` | Agent-integration helpers: `nudge`, `remind`, `notify`, `install <agent>`, `uninstall <agent>` |
 | `version` | Build info and cached release status |
 
 Commands that accept symbols support batch mode:
@@ -290,7 +291,7 @@ go run ./bench run     # run full benchmarks -> bench/RESULTS.md
 go run ./bench check   # compare current build against baseline
 ```
 
-Recent corpus results:
+Corpus results (cymbal v0.13.5, 11-repo corpus, 2026-05-29):
 
 - **Accuracy:** 113/113 top-level checks passed
 - **Ground truth:** 79/79 passed, with 100% search precision/recall and 100%
