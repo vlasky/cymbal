@@ -13,7 +13,7 @@ can wire into its native hook point:
 OpenCode and Claude Code have first-class installers:
 
 ```bash
-cymbal hook install opencode                 # <user-config-dir>/opencode/plugins/cymbal-opencode.js
+cymbal hook install opencode                 # ~/.config/opencode/plugins/cymbal-opencode.js
 cymbal hook install opencode --scope project
 cymbal hook uninstall opencode
 
@@ -207,14 +207,17 @@ cymbal hook install opencode
 What it does:
 
 - **User scope** installs a cymbal-managed plugin at
-  `<user-config-dir>/opencode/plugins/cymbal-opencode.js`
+  `~/.config/opencode/plugins/cymbal-opencode.js`
+  (or `$OPENCODE_CONFIG_DIR/plugins/cymbal-opencode.js` when that override is set)
 - **Project scope** installs a cymbal-managed plugin at
   `.opencode/plugins/cymbal-opencode.js`
 - The plugin refreshes startup guidance by calling
   `cymbal hook remind --format=text --update=if-stale`
-- The plugin soft-nudges bash `rg` / `grep` / `find` / `fd`-style commands
-  back toward cymbal-first navigation before the shell runs them on
-  non-Windows shells
+- The plugin exposes a single `CymbalPlugin` export for OpenCode's plugin
+  loader; helper functions stay internal so OpenCode does not try to load them
+  as plugins
+- The plugin soft-nudges Bash, Grep, and Glob code-search calls back toward
+  cymbal-first navigation before the tool runs on non-Windows shells
 - When an update is available, the plugin shows a **native OS notification**
   (macOS Notification Center, Linux `notify-send`, or Windows system tray)
   so users see it regardless of whether they're in TUI or Desktop mode
