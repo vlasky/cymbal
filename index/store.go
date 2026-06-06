@@ -1732,6 +1732,24 @@ func (s *Store) FindImpactScoped(symbolName, language string, depth, limit int) 
 // transitive caller chains while still admitting interop within a family.
 // A nil/empty langs set applies no restriction.
 func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limit int) ([]ImpactResult, error) {
+	results, _, err := s.findImpactInLangs(symbolName, langs, depth, limit, false)
+	return results, err
+}
+
+// findImpactInLangs is the BFS core. It additionally reports whether the
+// per-query limit truncated the result set, and can drop test-file callers
+// during traversal (noTests).
+//
+// Truncation is detected honestly: the walk over-fetches one row past limit, so
+// returning exactly limit callers reflects a real boundary (a (limit+1)th caller
+// existed) rather than a coincidental stop.
+//
+// noTests uses "hide but still traverse" semantics — a test caller is omitted
+// from results (and never consumes the limit budget) but its own callers are
+// still explored, so production code reachable through a test isn't lost. In the
+// caller direction tests are almost always terminal, so this rarely differs from
+// pruning; it is the safer default.
+func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
 	if depth <= 0 {
 		depth = 2
 	}
@@ -1746,11 +1764,15 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 		langFilter = " AND r.language IN (" + placeholders + ")"
 	}
 
+	// Over-fetch one past the limit so we can distinguish "exactly limit
+	// callers, no more" from "limit callers and the walk was cut short".
+	fetchTarget := limit + 1
+
 	seen := make(map[string]bool)
 	var results []ImpactResult
 	currentSymbols := []string{symbolName}
 
-	for d := 1; d <= depth && len(currentSymbols) > 0 && len(results) < limit; d++ {
+	for d := 1; d <= depth && len(currentSymbols) > 0 && len(results) < fetchTarget; d++ {
 		var nextSymbols []string
 		for _, sym := range currentSymbols {
 			args := []interface{}{sym}
@@ -1782,6 +1804,14 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 				}
 				seen[key] = true
 
+				// Traverse through the caller regardless, so production code
+				// behind a (hidden) test caller is still discovered.
+				nextSymbols = append(nextSymbols, caller)
+
+				if noTests && ClassifyPath(relPath) == PathClassTest {
+					continue
+				}
+
 				results = append(results, ImpactResult{
 					Symbol:  sym,
 					Caller:  caller,
@@ -1790,11 +1820,10 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 					Line:    line,
 					Depth:   d,
 				})
-				nextSymbols = append(nextSymbols, caller)
 
-				if len(results) >= limit {
+				if len(results) >= fetchTarget {
 					rows.Close()
-					return results, nil
+					return results[:limit], true, nil
 				}
 			}
 			rows.Close()
@@ -1802,5 +1831,5 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 		currentSymbols = nextSymbols
 	}
 
-	return results, nil
+	return results, false, nil
 }

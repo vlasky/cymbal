@@ -1166,13 +1166,16 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 // A seed spanning multiple languages uses the union of their families. With
 // ResolveScopeAll, or when the seed has no indexed language to scope from, it
 // is unrestricted.
-func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int) ([]ImpactResult, error) {
+//
+// noTests drops test-file callers during traversal. The returned bool reports
+// whether the per-symbol limit truncated the result set.
+func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	store, err := openCached(dbPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var langs []string
 	if NormalizeScope(scope) != ResolveScopeAll {
@@ -1180,7 +1183,7 @@ func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, l
 			langs = scopeLanguagesUnion(seedLangs, scope)
 		}
 	}
-	return store.FindImpactInLangs(symbolName, langs, depth, limit)
+	return store.findImpactInLangs(symbolName, langs, depth, limit, noTests)
 }
 
 // FindTrace performs downward call graph traversal for a symbol.

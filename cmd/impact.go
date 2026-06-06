@@ -31,6 +31,7 @@ Examples:
 		depth, _ := cmd.Flags().GetInt("depth")
 		limit, _ := cmd.Flags().GetInt("limit")
 		ctx, _ := cmd.Flags().GetInt("context")
+		noTests, _ := cmd.Flags().GetBool("no-tests")
 		scope, err := resolveScopeOrError(cmd)
 		if err != nil {
 			return err
@@ -52,7 +53,7 @@ Examples:
 
 		// Per-symbol seed-only federation: each name routes to whichever
 		// DB owns it, callers stay within that DB.
-		merged, sourceMap, labelMap, totalRaw, err := mergeImpactPlan(plan, names, depth, limit, scope)
+		merged, sourceMap, labelMap, totalRaw, truncated, err := mergeImpactPlan(plan, names, depth, limit, scope, noTests)
 		if err != nil {
 			return err
 		}
@@ -65,6 +66,7 @@ Examples:
 		}
 
 		ambig := ambiguousSymbolLanguages(plan, names)
+		prodN, testN, unknownN := classifyImpact(merged)
 
 		if jsonOut {
 			enriched := enrichImpact(merged, ctx)
@@ -79,11 +81,17 @@ Examples:
 				})
 			}
 			payload := map[string]any{
-				"symbols":       names,
-				"total_callers": len(merged),
-				"raw_rows":      totalRaw,
-				"resolve_scope": string(scope),
-				"results":       out,
+				"symbols":            names,
+				"total_callers":      len(merged),
+				"production_callers": prodN,
+				"test_callers":       testN,
+				"raw_rows":           totalRaw,
+				"truncated":          truncated,
+				"resolve_scope":      string(scope),
+				"results":            out,
+			}
+			if unknownN > 0 {
+				payload["unknown_callers"] = unknownN
 			}
 			if len(ambig) > 0 {
 				payload["symbol_languages"] = ambig
@@ -143,7 +151,10 @@ Examples:
 		if totalGroups < len(merged) {
 			meta = append(meta, kv{"groups", fmt.Sprintf("%d", totalGroups)})
 		}
-		meta = append(meta, kv{"total_callers", fmt.Sprintf("%d", len(merged))})
+		meta = append(meta, kv{"total_callers", formatCallerCounts(len(merged), prodN, testN, unknownN)})
+		if truncated {
+			meta = append(meta, kv{"truncated", "true"})
+		}
 		meta = append(meta, kv{"resolve_scope", string(scope)})
 		if s := formatSymbolLanguages(ambig); s != "" {
 			meta = append(meta, kv{"symbol_languages", s})
@@ -163,6 +174,7 @@ func init() {
 	impactCmd.Flags().IntP("depth", "D", 2, "max call-chain depth (max 5)")
 	impactCmd.Flags().IntP("limit", "n", 50, "max results per symbol")
 	impactCmd.Flags().IntP("context", "C", 1, "lines of context around each call site (0 for single-line)")
+	impactCmd.Flags().Bool("no-tests", false, "exclude callers in test files (keeps production + unknown)")
 	addStdinFlag(impactCmd)
 	addGraphFlags(impactCmd)
 	addResolveScopeFlag(impactCmd)
@@ -180,14 +192,15 @@ func impactKey(r index.ImpactResult) string {
 // mergeImpact runs FindImpact for each requested symbol against a single DB.
 // Retained for back-compat with existing single-DB callers (tests).
 func mergeImpact(dbPath string, names []string, depth, limit int) ([]index.ImpactResult, map[string][]string, int, error) {
-	merged, source, _, raw, err := runMergeImpact(names, depth, limit, index.ResolveScopeFamily, func(string) string { return dbPath })
+	merged, source, _, raw, _, err := runMergeImpact(names, depth, limit, index.ResolveScopeFamily, false, func(string) string { return dbPath })
 	return merged, source, raw, err
 }
 
 // mergeImpactPlan is the federation-aware variant. Each requested name routes
 // to whichever DB in plan.Federated owns the seed; downstream callers stay
 // within that DB (non-goal #1). labelMap maps each name to its worktree label.
-func mergeImpactPlan(plan DBPlan, names []string, depth, limit int, scope index.ResolveScope) ([]index.ImpactResult, map[string][]string, map[string]string, int, error) {
+// The returned bool is true if any seed's per-symbol limit truncated its callers.
+func mergeImpactPlan(plan DBPlan, names []string, depth, limit int, scope index.ResolveScope, noTests bool) ([]index.ImpactResult, map[string][]string, map[string]string, int, bool, error) {
 	resolve := func(name string) string {
 		entry, _ := findSymbolEntry(plan, name)
 		return entry.Path
@@ -197,22 +210,27 @@ func mergeImpactPlan(plan DBPlan, names []string, depth, limit int, scope index.
 		entry, _ := findSymbolEntry(plan, name)
 		labelMap[name] = entry.Label()
 	}
-	merged, source, _, raw, err := runMergeImpact(names, depth, limit, scope, resolve)
-	return merged, source, labelMap, raw, err
+	merged, source, _, raw, truncated, err := runMergeImpact(names, depth, limit, scope, noTests, resolve)
+	return merged, source, labelMap, raw, truncated, err
 }
 
 // runMergeImpact factors the shared dedup logic so the single-DB and
-// federated paths don't drift apart over time.
-func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, error) {
+// federated paths don't drift apart over time. The returned bool is true if any
+// seed symbol hit its per-symbol limit (the merged set may be incomplete).
+func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, noTests bool, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, bool, error) {
 	var merged []index.ImpactResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{} // key -> index in merged
 	totalRaw := 0
+	truncated := false
 	for _, name := range names {
 		dbPath := dbForName(name)
-		rows, err := index.FindImpactWithScope(dbPath, name, scope, depth, limit)
+		rows, tr, err := index.FindImpactWithScope(dbPath, name, scope, depth, limit, noTests)
 		if err != nil {
-			return nil, nil, nil, 0, err
+			return nil, nil, nil, 0, false, err
+		}
+		if tr {
+			truncated = true
 		}
 		totalRaw += len(rows)
 		for _, r := range rows {
@@ -242,7 +260,39 @@ func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, 
 			}
 		}
 	}
-	return merged, sourceMap, seen, totalRaw, nil
+	return merged, sourceMap, seen, totalRaw, truncated, nil
+}
+
+// classifyImpact splits a caller set into production / test / unknown counts by
+// each caller's file path. Used for the header/JSON triage split.
+func classifyImpact(rows []index.ImpactResult) (prod, test, unknown int) {
+	for _, r := range rows {
+		switch index.ClassifyPath(r.RelPath) {
+		case index.PathClassTest:
+			test++
+		case index.PathClassUnknown:
+			unknown++
+		default:
+			prod++
+		}
+	}
+	return prod, test, unknown
+}
+
+// formatCallerCounts renders "N" or "N (P production, T test, U unknown)",
+// omitting zero buckets so well-classified output stays terse.
+func formatCallerCounts(total, prod, test, unknown int) string {
+	if test == 0 && unknown == 0 {
+		return fmt.Sprintf("%d", total)
+	}
+	parts := []string{fmt.Sprintf("%d production", prod)}
+	if test > 0 {
+		parts = append(parts, fmt.Sprintf("%d test", test))
+	}
+	if unknown > 0 {
+		parts = append(parts, fmt.Sprintf("%d unknown", unknown))
+	}
+	return fmt.Sprintf("%d (%s)", total, strings.Join(parts, ", "))
 }
 
 // summarizeWorktreeLabels collapses per-name labels into a single meta
