@@ -108,43 +108,61 @@ when truncated. Operates only on the current worktree.`,
 
 		skipped := 0
 		for _, f := range parseChangedFiles(string(out)) {
-			langPath := f.NewPath
-			if langPath == "" {
-				langPath = f.OldPath
-			}
-			l := lang.Default.ForFile(langPath)
-			if f.Binary || l == nil || !l.Parseable() {
-				skipped++ // binary, unindexed, unsupported, or non-code
+			if f.Binary {
+				skipped++
 				continue
 			}
+			fileParsed := false
 
-			// New side: added/modified symbols, and the set of names that still
-			// exist (used to tell a modification from a deletion).
+			// New side: added/modified symbols, plus the set of names that
+			// survive — used to tell a modification from a deletion. Each side is
+			// judged by its own path's language (parseBlobSymbols), so an
+			// extension-changing rename still parses whichever side is code.
 			newNames := map[string]bool{}
+			newParsed := false
 			if f.NewPath != "" {
 				if blob, rerr := readNewSide(repoRoot, staged, f.NewPath); rerr == nil {
-					newSyms := parseBlobSymbols(blob, f.NewPath)
-					for i := range newSyms {
-						newNames[newSyms[i].Name] = true
-					}
-					for _, s := range innermostChanged(newSyms, f.NewLines) {
-						add(changed, &changedOrder, s.Name, f.NewPath)
-					}
-				}
-			}
-
-			// Old side: a changed old symbol still present on the new side was
-			// modified; one that's gone was deleted.
-			if f.OldPath != "" && len(f.OldLines) > 0 {
-				if blob, rerr := readOldSide(repoRoot, oldRev, f.OldPath); rerr == nil {
-					for _, s := range innermostChanged(parseBlobSymbols(blob, f.OldPath), f.OldLines) {
-						if newNames[s.Name] {
-							add(changed, &changedOrder, s.Name, f.OldPath)
-						} else {
-							add(deleted, &deletedOrder, s.Name, f.OldPath)
+					if newSyms, ok := parseBlobSymbols(blob, f.NewPath); ok {
+						newParsed = true
+						fileParsed = true
+						for i := range newSyms {
+							newNames[newSyms[i].Name] = true
+						}
+						for _, s := range innermostChanged(newSyms, f.NewLines) {
+							add(changed, &changedOrder, s.Name, f.NewPath)
 						}
 					}
 				}
+			}
+
+			// Old side: classify each changed old symbol. It's deleted only when
+			// the file is gone (NewPath == "") or the new side parsed cleanly and
+			// no longer has that name — never when the new side merely failed to
+			// parse, which would manufacture false deletions.
+			if f.OldPath != "" && len(f.OldLines) > 0 {
+				if blob, rerr := readOldSide(repoRoot, oldRev, f.OldPath); rerr == nil {
+					if oldSyms, ok := parseBlobSymbols(blob, f.OldPath); ok {
+						fileParsed = true
+						for _, s := range innermostChanged(oldSyms, f.OldLines) {
+							gone := f.NewPath == "" || (newParsed && !newNames[s.Name])
+							if gone {
+								add(deleted, &deletedOrder, s.Name, f.OldPath)
+							} else {
+								// Still present (or new side unknown): a modification.
+								// Prefer the new path when the file still exists.
+								file := f.NewPath
+								if file == "" {
+									file = f.OldPath
+								}
+								add(changed, &changedOrder, s.Name, file)
+							}
+						}
+					}
+				}
+			}
+
+			if !fileParsed {
+				skipped++ // binary, unsupported, oversized, or unreadable on both sides
 			}
 		}
 		sort.Strings(changedOrder)
@@ -456,12 +474,18 @@ func leadingInt(s string) int {
 }
 
 // readNewSide returns the new-side content: the staged blob under --staged, the
-// working-tree file otherwise.
+// working-tree file otherwise. A working-tree symlink is rejected — git's blob
+// for a symlink is the link target text, so following it would parse the wrong
+// file's content.
 func readNewSide(repoRoot string, staged bool, path string) ([]byte, error) {
 	if staged {
 		return catFileBlob(repoRoot, ":"+path)
 	}
-	return os.ReadFile(filepath.Join(repoRoot, path))
+	full := filepath.Join(repoRoot, path)
+	if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("symlink: %s", path)
+	}
+	return os.ReadFile(full)
 }
 
 // readOldSide returns the base-revision blob for a path.
@@ -473,27 +497,30 @@ func catFileBlob(repoRoot, spec string) ([]byte, error) {
 	return exec.Command("git", "-C", repoRoot, "cat-file", "blob", spec).Output()
 }
 
-// parseBlobSymbols parses in-memory content for a path into symbols, returning
-// nil when the content can't or shouldn't be parsed (too large, binary, or a
-// recognised-but-not-parseable language). Line numbers are 1-based, matching the
-// diff. CRLF is left intact (git and tree-sitter both count LF rows).
-func parseBlobSymbols(src []byte, path string) []symbols.Symbol {
-	if len(src) == 0 || len(src) > maxChangedParseBytes {
-		return nil
+// parseBlobSymbols parses in-memory content for a path into symbols. The bool is
+// false when the content can't or shouldn't be parsed (too large, binary, a
+// recognised-but-not-parseable language, or a parser error) — distinct from a
+// successful parse that simply yields no symbols (true, empty slice). Callers
+// must not treat a parse failure as "no symbols here", or deletions inferred
+// from an empty new side would be wrong. Line numbers are 1-based, matching the
+// diff; CRLF is left intact (git and tree-sitter both count LF rows).
+func parseBlobSymbols(src []byte, path string) ([]symbols.Symbol, bool) {
+	if len(src) > maxChangedParseBytes {
+		return nil, false
 	}
 	if bytes.IndexByte(src, 0) >= 0 {
-		return nil // binary
+		return nil, false // binary
 	}
 	l := lang.Default.ForFile(path)
 	if l == nil || !l.Parseable() {
-		return nil
+		return nil, false
 	}
 	src = bytes.TrimPrefix(src, []byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM (does not shift rows)
 	res, err := parser.ParseBytes(src, path, l.Name)
 	if err != nil || res == nil {
-		return nil
+		return nil, false
 	}
-	return res.Symbols
+	return res.Symbols, true
 }
 
 // innermostChanged returns the most specific navigable definition containing

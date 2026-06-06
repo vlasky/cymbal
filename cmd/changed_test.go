@@ -178,6 +178,39 @@ func TestAggregateReferencesSumsAcrossSeeds(t *testing.T) {
 	}
 }
 
+func TestParseBlobSymbolsOKSemantics(t *testing.T) {
+	// Valid Go source parses (ok=true) and yields symbols.
+	syms, ok := parseBlobSymbols([]byte("package p\n\nfunc Foo() {}\n"), "p.go")
+	if !ok {
+		t.Fatalf("valid Go source should parse ok")
+	}
+	found := false
+	for _, s := range syms {
+		if s.Name == "Foo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Foo symbol, got %+v", syms)
+	}
+
+	// Binary content (NUL byte) is not parseable.
+	if _, ok := parseBlobSymbols([]byte("pack\x00age"), "p.go"); ok {
+		t.Errorf("binary content should report ok=false")
+	}
+
+	// Recognised-but-not-parseable / unsupported extension is not parseable.
+	if _, ok := parseBlobSymbols([]byte("hello world"), "notes.txt"); ok {
+		t.Errorf("unsupported extension should report ok=false")
+	}
+
+	// A successfully parsed file with no symbols is ok=true (distinct from a
+	// parse failure) — this is what prevents false deletions on an emptied file.
+	if _, ok := parseBlobSymbols([]byte("package p\n"), "p.go"); !ok {
+		t.Errorf("empty-but-valid Go file should report ok=true")
+	}
+}
+
 func sortedInts(m map[int]bool) []int {
 	out := make([]int, 0, len(m))
 	for k := range m {
