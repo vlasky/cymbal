@@ -6,9 +6,10 @@ import (
 	"testing"
 
 	"github.com/1broseidon/cymbal/index"
+	"github.com/1broseidon/cymbal/symbols"
 )
 
-func TestParseChangedFilesAttributesAddedAndDeletedLines(t *testing.T) {
+func TestParseChangedFilesTracksOldAndNewLines(t *testing.T) {
 	diff := `diff --git a/foo.go b/foo.go
 index abc..def 100644
 --- a/foo.go
@@ -32,27 +33,81 @@ diff --git a/logo.png b/logo.png
 index 1111..2222 100644
 Binary files a/logo.png and b/logo.png differ
 `
-	touched, deleted, binary := parseChangedFiles(diff)
-
-	got := sortedInts(touched["foo.go"])
-	want := []int{11, 12, 21} // 11,12 added; 21 deletion anchor
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("foo.go touched lines = %v, want %v", got, want)
+	files := parseChangedFiles(diff)
+	byNew := map[string]changedFile{}
+	for _, f := range files {
+		key := f.NewPath
+		if key == "" {
+			key = f.OldPath
+		}
+		byNew[key] = f
 	}
 
-	if len(deleted) != 1 || deleted[0] != "gone.go" {
-		t.Errorf("deleted = %v, want [gone.go]", deleted)
+	foo := byNew["foo.go"]
+	if got, want := sortedInts(foo.NewLines), []int{11, 12}; !reflect.DeepEqual(got, want) {
+		t.Errorf("foo.go new lines = %v, want %v", got, want)
 	}
-	if _, ok := touched["gone.go"]; ok {
-		t.Errorf("deleted file should not appear in touched set")
+	if got, want := sortedInts(foo.OldLines), []int{20}; !reflect.DeepEqual(got, want) {
+		t.Errorf("foo.go old lines = %v, want %v (deletion on old side)", got, want)
 	}
-	if binary != 1 {
-		t.Errorf("binary count = %d, want 1", binary)
+
+	gone := byNew["gone.go"]
+	if gone.NewPath != "" {
+		t.Errorf("gone.go new path = %q, want empty (/dev/null)", gone.NewPath)
+	}
+	if got, want := sortedInts(gone.OldLines), []int{1, 2}; !reflect.DeepEqual(got, want) {
+		t.Errorf("gone.go old lines = %v, want %v", got, want)
+	}
+
+	// Binary files have no ---/+++ path lines, so the flag rides an entry with
+	// empty paths; RunE counts those as skipped.
+	binaryCount := 0
+	for _, f := range files {
+		if f.Binary {
+			binaryCount++
+		}
+	}
+	if binaryCount != 1 {
+		t.Errorf("binary files flagged = %d, want 1", binaryCount)
+	}
+}
+
+func TestDiffPathSideDecodesQuotedAndStripsPrefix(t *testing.T) {
+	cases := map[string]string{
+		"a/foo.go":          "foo.go",
+		"b/pkg/bar.go":      "pkg/bar.go",
+		"/dev/null":         "",
+		`"b/with space.go"`: "with space.go",
+		`"a/tab\there.go"`:  "tab\there.go",
+		"a/b/keep.go":       "b/keep.go", // only the leading a/ is stripped
+	}
+	for in, want := range cases {
+		if got := diffPathSide(in); got != want {
+			t.Errorf("diffPathSide(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestParseHunkStarts(t *testing.T) {
+	cases := []struct {
+		header             string
+		oldStart, newStart int
+	}{
+		{"@@ -10,3 +12,4 @@", 10, 12},
+		{"@@ -1 +1 @@", 1, 1},
+		{"@@ -0,0 +1,5 @@ new file", 0, 1},
+		{"@@ -7,2 +0,0 @@", 7, 0},
+	}
+	for _, c := range cases {
+		o, n, ok := parseHunkStarts(c.header)
+		if !ok || o != c.oldStart || n != c.newStart {
+			t.Errorf("parseHunkStarts(%q) = (%d,%d,%v), want (%d,%d,true)", c.header, o, n, ok, c.oldStart, c.newStart)
+		}
 	}
 }
 
 func TestInnermostChangedSkipsLocalsPrefersInnerDefinition(t *testing.T) {
-	syms := []index.SymbolResult{
+	syms := []symbols.Symbol{
 		{Name: "DoWork", Kind: "function", Depth: 0, StartLine: 10, EndLine: 20},
 		{Name: "local", Kind: "variable", Depth: 1, StartLine: 15, EndLine: 15},
 		{Name: "Widget", Kind: "class", Depth: 0, StartLine: 30, EndLine: 60},
@@ -75,21 +130,22 @@ func TestInnermostChangedSkipsLocalsPrefersInnerDefinition(t *testing.T) {
 
 func TestIsChangedUnit(t *testing.T) {
 	cases := []struct {
-		s    index.SymbolResult
-		want bool
+		kind  string
+		depth int
+		want  bool
 	}{
-		{index.SymbolResult{Kind: "function", Depth: 0}, true},
-		{index.SymbolResult{Kind: "function", Depth: 1}, true},  // Python/Rust method
-		{index.SymbolResult{Kind: "method", Depth: 1}, true},
-		{index.SymbolResult{Kind: "variable", Depth: 0}, true},  // top-level var
-		{index.SymbolResult{Kind: "variable", Depth: 1}, false}, // local var
-		{index.SymbolResult{Kind: "type", Depth: 1}, false},     // function-local type
-		{index.SymbolResult{Kind: "type", Depth: 0}, true},
-		{index.SymbolResult{Kind: "constant", Depth: 2}, false},
+		{"function", 0, true},
+		{"function", 1, true}, // Python/Rust method
+		{"method", 1, true},
+		{"variable", 0, true},  // top-level var
+		{"variable", 1, false}, // local var
+		{"type", 1, false},     // function-local type
+		{"type", 0, true},
+		{"constant", 2, false},
 	}
 	for _, c := range cases {
-		if got := isChangedUnit(c.s); got != c.want {
-			t.Errorf("isChangedUnit(%+v) = %v, want %v", c.s, got, c.want)
+		if got := isChangedUnit(c.kind, c.depth); got != c.want {
+			t.Errorf("isChangedUnit(%q, %d) = %v, want %v", c.kind, c.depth, got, c.want)
 		}
 	}
 }

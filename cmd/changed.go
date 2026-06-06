@@ -1,16 +1,25 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/1broseidon/cymbal/index"
+	"github.com/1broseidon/cymbal/lang"
+	"github.com/1broseidon/cymbal/parser"
+	"github.com/1broseidon/cymbal/symbols"
 	"github.com/spf13/cobra"
 )
+
+// maxChangedParseBytes mirrors the walker's large-file skip threshold so
+// on-demand blob parsing never blows up on a giant generated file.
+const maxChangedParseBytes = 3407872 // 3.25 MiB
 
 var changedCmd = &cobra.Command{
 	Use:   "changed",
@@ -26,19 +35,20 @@ staged changes, or --base <ref> to diff the working tree against another ref
   cymbal changed --staged        # staged changes vs HEAD
   cymbal changed --base main     # working tree vs main
 
-Changed symbols are attributed by overlapping the diff's changed lines with the
-index's symbol ranges. Impact is name-scoped (cymbal resolves references by
-name): when a changed name has several definitions the count may span them, and
-that ambiguity is reported. Operates only on the current worktree.
+Changed symbols are attributed by parsing the actual diffed blobs on both sides:
+added/modified lines map to symbols in the new version, deleted lines to symbols
+in the old version, so whole-symbol deletions are named (not mis-attributed to a
+neighbour) and --staged attribution matches the staged content even with
+unstaged edits present. References and impact are then queried from the
+working-tree index (the "what's affected now" question), name-scoped (cymbal
+resolves references by name): when a changed name has several definitions the
+counts may span them, and that is reported as definition_count.
 
 Limitations: arbitrary commit ranges whose new side is not the working tree are
-not supported (the index reflects the working tree). Deleted files are reported
-but their impact is not computed; a deletion inside a file is attributed to the
-symbol at the deletion point, which can be a neighbour when a whole symbol is
-removed (no old-side line info is available). With --staged, symbols come from
-the working tree, so attribution may be off where staged and unstaged edits
-overlap. Reference counts are exact (un-truncated) but name-scoped; caller
-counts are capped by --limit and flagged when truncated.`,
+not supported (the index reflects the working tree). Deleted symbols are listed
+but have no impact (they no longer exist). Reference counts are exact
+(un-truncated) but name-scoped; caller counts are capped by --limit and flagged
+when truncated. Operates only on the current worktree.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath := getDBPath(cmd)
@@ -70,56 +80,83 @@ counts are capped by --limit and flagged when truncated.`,
 		if err != nil {
 			return err
 		}
-		// core.quotePath=false keeps non-ASCII paths un-escaped so they match
-		// the index; gitArgs precede the subcommand.
-		gitArgs := append([]string{"-C", repoRoot, "-c", "core.quotePath=false"}, diffArgs...)
-		out, err := exec.Command("git", gitArgs...).Output()
+		out, err := exec.Command("git", append([]string{"-C", repoRoot}, diffArgs...)...).Output()
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
 				return fmt.Errorf("git diff: %s", strings.TrimSpace(string(exitErr.Stderr)))
 			}
 		}
 
-		// --staged describes the index, but symbols are indexed from the working
-		// tree; if unstaged edits coexist, staged line numbers may not line up
-		// with indexed symbol ranges. Warn rather than mislead.
-		if staged {
-			if unstaged, derr := exec.Command("git", "-C", repoRoot, "diff", "--name-only").Output(); derr == nil && len(strings.TrimSpace(string(unstaged))) > 0 {
-				fmt.Fprintln(os.Stderr, "warning: working tree has unstaged changes; --staged attribution may be inaccurate where staged and unstaged edits overlap")
+		oldRev := "HEAD"
+		if base != "" {
+			oldRev = base
+		}
+
+		// Attribute changed lines to symbols by parsing each diffed blob.
+		changed := map[string]map[string]struct{}{} // name -> referencing files
+		deleted := map[string]map[string]struct{}{} // name -> files it was removed from
+		var changedOrder, deletedOrder []string
+		add := func(m map[string]map[string]struct{}, order *[]string, name, file string) {
+			if m[name] == nil {
+				m[name] = map[string]struct{}{}
+				*order = append(*order, name)
+			}
+			if file != "" {
+				m[name][file] = struct{}{}
 			}
 		}
 
-		touched, deleted, binaryCount := parseChangedFiles(string(out))
-
-		// Attribute changed lines to symbols, aggregated by name across files.
-		byName := map[string]map[string]struct{}{} // name -> set of files
-		var order []string
-		skippedNoSymbols := 0
-		for rel, lines := range touched {
-			abs := canonicalExistingPath(filepath.Join(repoRoot, rel))
-			syms, ferr := index.FileOutline(dbPath, abs)
-			if ferr != nil || len(syms) == 0 {
-				skippedNoSymbols++ // changed but unindexed / unsupported / non-code
+		skipped := 0
+		for _, f := range parseChangedFiles(string(out)) {
+			langPath := f.NewPath
+			if langPath == "" {
+				langPath = f.OldPath
+			}
+			l := lang.Default.ForFile(langPath)
+			if f.Binary || l == nil || !l.Parseable() {
+				skipped++ // binary, unindexed, unsupported, or non-code
 				continue
 			}
-			for _, s := range innermostChanged(syms, lines) {
-				if byName[s.Name] == nil {
-					byName[s.Name] = map[string]struct{}{}
-					order = append(order, s.Name)
+
+			// New side: added/modified symbols, and the set of names that still
+			// exist (used to tell a modification from a deletion).
+			newNames := map[string]bool{}
+			if f.NewPath != "" {
+				if blob, rerr := readNewSide(repoRoot, staged, f.NewPath); rerr == nil {
+					newSyms := parseBlobSymbols(blob, f.NewPath)
+					for i := range newSyms {
+						newNames[newSyms[i].Name] = true
+					}
+					for _, s := range innermostChanged(newSyms, f.NewLines) {
+						add(changed, &changedOrder, s.Name, f.NewPath)
+					}
 				}
-				byName[s.Name][rel] = struct{}{}
+			}
+
+			// Old side: a changed old symbol still present on the new side was
+			// modified; one that's gone was deleted.
+			if f.OldPath != "" && len(f.OldLines) > 0 {
+				if blob, rerr := readOldSide(repoRoot, oldRev, f.OldPath); rerr == nil {
+					for _, s := range innermostChanged(parseBlobSymbols(blob, f.OldPath), f.OldLines) {
+						if newNames[s.Name] {
+							add(changed, &changedOrder, s.Name, f.OldPath)
+						} else {
+							add(deleted, &deletedOrder, s.Name, f.OldPath)
+						}
+					}
+				}
 			}
 		}
-		sort.Strings(order)
+		sort.Strings(changedOrder)
+		sort.Strings(deletedOrder)
 
-		analyzed := order
+		analyzed := changedOrder
 		symbolsTruncated := false
-		if maxSymbols > 0 && len(order) > maxSymbols {
-			analyzed = order[:maxSymbols]
+		if maxSymbols > 0 && len(changedOrder) > maxSymbols {
+			analyzed = changedOrder[:maxSymbols]
 			symbolsTruncated = true
 		}
 
-		// Per-symbol references + impact, with an aggregate impact-row cap.
 		type changedResult struct {
 			Symbol          string                `json:"symbol"`
 			Files           []string              `json:"files"`
@@ -133,7 +170,7 @@ counts are capped by --limit and flagged when truncated.`,
 		impactTruncated := false
 		aggRows := 0
 		for _, name := range analyzed {
-			res := changedResult{Symbol: name, Files: sortedKeys(byName[name])}
+			res := changedResult{Symbol: name, Files: sortedKeys(changed[name])}
 			if syms, derr := index.SymbolsByName(dbPath, name); derr == nil {
 				res.DefinitionCount = len(syms)
 			}
@@ -165,34 +202,28 @@ counts are capped by --limit and flagged when truncated.`,
 		}
 
 		truncated := symbolsTruncated || impactTruncated
-		skipped := skippedNoSymbols + binaryCount
 
-		// renderWarnings appends deleted/skipped notes, shown in both the normal
-		// and the no-changed-symbols cases so they're never silently lost.
-		renderWarnings := func(b *strings.Builder) {
-			if len(deleted) == 0 && skipped == 0 {
-				return
-			}
-			b.WriteString("\nwarnings:\n")
-			if len(deleted) > 0 {
-				fmt.Fprintf(b, "  %d deleted file(s) not analyzed: %s\n", len(deleted), strings.Join(deleted, ", "))
-			}
-			if skipped > 0 {
-				fmt.Fprintf(b, "  %d changed file(s) had no indexed symbols (binary, unindexed, or non-code)\n", skipped)
-			}
+		// deletedList pairs each removed symbol with the file(s) it left.
+		type deletedSym struct {
+			Symbol string   `json:"symbol"`
+			Files  []string `json:"files"`
+		}
+		var deletedList []deletedSym
+		for _, name := range deletedOrder {
+			deletedList = append(deletedList, deletedSym{Symbol: name, Files: sortedKeys(deleted[name])})
 		}
 
 		if jsonOut {
 			payload := map[string]any{
 				"base":            baseLabel,
-				"changed_symbols": len(order),
+				"changed_symbols": len(changedOrder),
 				"analyzed":        len(analyzed),
 				"truncated":       truncated,
 				"resolve_scope":   string(scope),
 				"results":         results,
 			}
-			if len(deleted) > 0 {
-				payload["deleted_files"] = deleted
+			if len(deletedList) > 0 {
+				payload["deleted_symbols"] = deletedList
 			}
 			if skipped > 0 {
 				payload["skipped_files"] = skipped
@@ -200,7 +231,20 @@ counts are capped by --limit and flagged when truncated.`,
 			return writeJSON(payload)
 		}
 
-		if len(order) == 0 {
+		renderWarnings := func(b *strings.Builder) {
+			if len(deletedList) == 0 && skipped == 0 {
+				return
+			}
+			b.WriteString("\nwarnings:\n")
+			for _, d := range deletedList {
+				fmt.Fprintf(b, "  deleted: %s (%s)\n", d.Symbol, strings.Join(d.Files, ", "))
+			}
+			if skipped > 0 {
+				fmt.Fprintf(b, "  %d changed file(s) had no parseable symbols (binary, unsupported, or non-code)\n", skipped)
+			}
+		}
+
+		if len(changedOrder) == 0 {
 			var b strings.Builder
 			b.WriteString("No changed symbols found in the diff.\n")
 			renderWarnings(&b)
@@ -240,11 +284,11 @@ counts are capped by --limit and flagged when truncated.`,
 		renderWarnings(&content)
 
 		meta := []kv{
-			{"changed_symbols", fmt.Sprintf("%d", len(order))},
+			{"changed_symbols", fmt.Sprintf("%d", len(changedOrder))},
 			{"base", baseLabel},
 		}
 		if symbolsTruncated {
-			meta = append(meta, kv{"analyzed", fmt.Sprintf("%d of %d", len(analyzed), len(order))})
+			meta = append(meta, kv{"analyzed", fmt.Sprintf("%d of %d", len(analyzed), len(changedOrder))})
 		}
 		if truncated {
 			meta = append(meta, kv{"truncated", "true"})
@@ -276,10 +320,11 @@ func init() {
 	rootCmd.AddCommand(changedCmd)
 }
 
-// changedDiffArgs builds the git-diff argument list for the requested mode and
-// a human label for the comparison base.
+// changedDiffArgs builds the git-diff argument list for the requested mode and a
+// human label for the comparison base. core.quotePath=false reduces path
+// escaping; remaining C-quoted paths are decoded when parsed.
 func changedDiffArgs(staged bool, base string) ([]string, string, error) {
-	common := []string{"diff", "--no-ext-diff", "--find-renames"}
+	common := []string{"-c", "core.quotePath=false", "diff", "--no-ext-diff", "--find-renames"}
 	switch {
 	case staged && base != "":
 		return nil, "", fmt.Errorf("--staged and --base are mutually exclusive")
@@ -295,95 +340,174 @@ func changedDiffArgs(staged bool, base string) ([]string, string, error) {
 	}
 }
 
-// parseChangedFiles walks unified diff output and returns, per new-side file
-// path, the set of new-side line numbers that were added or sit at a deletion
-// point, plus the paths of fully-deleted files. Attributing on changed lines
-// (not whole hunks, which include unchanged context) keeps neighbouring symbols
-// from being falsely flagged.
-func parseChangedFiles(diff string) (touched map[string]map[int]bool, deleted []string, binary int) {
-	touched = map[string]map[int]bool{}
+// changedFile is one file's diff: which old- and new-side line numbers changed,
+// and the path on each side ("" when the side is /dev/null).
+type changedFile struct {
+	OldPath, NewPath string
+	OldLines         map[int]bool
+	NewLines         map[int]bool
+	Binary           bool
+}
 
-	var curFile, oldPath string
-	newLine := 0
+// parseChangedFiles walks unified diff output into per-file changed-line sets.
+// New-side line numbers track '+' (added) lines; old-side track '-' (deleted)
+// lines. Attributing on changed lines — never whole hunks (which include
+// unchanged context) — keeps neighbouring symbols from being falsely flagged.
+func parseChangedFiles(diff string) []changedFile {
+	var files []changedFile
+	var cur *changedFile
+	oldLine, newLine := 0, 0
 	inHunk := false
+	flush := func() {
+		if cur != nil {
+			files = append(files, *cur)
+			cur = nil
+		}
+	}
 
 	for _, line := range strings.Split(diff, "\n") {
 		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			flush()
+			cur = &changedFile{OldLines: map[int]bool{}, NewLines: map[int]bool{}}
+			inHunk = false
+		case cur == nil:
+			// preamble before the first file header
 		case strings.HasPrefix(line, "Binary files "):
-			binary++
+			cur.Binary = true
 			inHunk = false
 		case strings.HasPrefix(line, "--- "):
-			oldPath = stripDiffPrefix(strings.TrimPrefix(line, "--- "))
+			cur.OldPath = diffPathSide(strings.TrimPrefix(line, "--- "))
 			inHunk = false
 		case strings.HasPrefix(line, "+++ "):
-			p := strings.TrimPrefix(line, "+++ ")
-			if strings.TrimSpace(p) == "/dev/null" {
-				if oldPath != "" {
-					deleted = append(deleted, oldPath)
-				}
-				curFile = ""
-			} else {
-				curFile = stripDiffPrefix(p)
-			}
+			cur.NewPath = diffPathSide(strings.TrimPrefix(line, "+++ "))
 			inHunk = false
 		case strings.HasPrefix(line, "@@"):
-			newStart, _ := parseHunkHeader(line)
-			if newStart > 0 {
-				newLine = newStart
+			if o, n, ok := parseHunkStarts(line); ok {
+				oldLine, newLine = o, n
 				inHunk = true
 			}
-		case !inHunk || curFile == "":
-			// outside a hunk body, or no resolvable new-side file
+		case !inHunk:
+			// metadata between header and first hunk (index, mode, rename …)
 		case strings.HasPrefix(line, "\\"):
-			// "\ No newline at end of file" — not a real line
+			// "\ No newline at end of file"
 		case strings.HasPrefix(line, "+"):
-			mark(touched, curFile, newLine)
+			if newLine > 0 {
+				cur.NewLines[newLine] = true
+			}
 			newLine++
 		case strings.HasPrefix(line, "-"):
-			// Deletion: anchor at the current new-side position so the enclosing
-			// symbol is still attributed; new-side line number does not advance.
-			mark(touched, curFile, newLine)
+			if oldLine > 0 {
+				cur.OldLines[oldLine] = true
+			}
+			oldLine++
 		default:
-			// context line (leading space) or empty
+			// context line (leading space) or blank
+			oldLine++
 			newLine++
 		}
 	}
-	return touched, deleted, binary
+	flush()
+	return files
 }
 
-func mark(m map[string]map[int]bool, file string, line int) {
-	if line <= 0 {
-		return
+// diffPathSide decodes one side of a diff file header: it un-C-quotes the path
+// (git escapes tabs, quotes, backslashes, and — without core.quotePath=false —
+// high bytes), maps /dev/null to "", and strips the a/ or b/ prefix. It must
+// not trim surrounding whitespace, which can be part of a filename.
+func diffPathSide(p string) string {
+	p = strings.TrimSuffix(p, "\r")
+	if strings.HasPrefix(p, `"`) {
+		if dec, err := strconv.Unquote(p); err == nil {
+			p = dec
+		}
 	}
-	if m[file] == nil {
-		m[file] = map[int]bool{}
+	if p == "/dev/null" {
+		return ""
 	}
-	m[file][line] = true
-}
-
-// stripDiffPrefix removes git's a/ or b/ path prefix.
-func stripDiffPrefix(p string) string {
-	p = strings.TrimRight(p, "\r\n")
-	p = strings.TrimSpace(p)
-	if strings.HasPrefix(p, "a/") || strings.HasPrefix(p, "b/") {
+	switch {
+	case strings.HasPrefix(p, "a/"):
+		return p[2:]
+	case strings.HasPrefix(p, "b/"):
 		return p[2:]
 	}
 	return p
 }
 
+// parseHunkStarts reads the old- and new-side starting line numbers from a
+// unified diff hunk header "@@ -oldStart[,c] +newStart[,c] @@". Zero is a valid
+// start (empty side of an add/delete), so callers must not require > 0.
+func parseHunkStarts(header string) (oldStart, newStart int, ok bool) {
+	minus := strings.IndexByte(header, '-')
+	plus := strings.IndexByte(header, '+')
+	if minus < 0 || plus < 0 {
+		return 0, 0, false
+	}
+	return leadingInt(header[minus+1:]), leadingInt(header[plus+1:]), true
+}
+
+func leadingInt(s string) int {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	n, _ := strconv.Atoi(s[:i])
+	return n
+}
+
+// readNewSide returns the new-side content: the staged blob under --staged, the
+// working-tree file otherwise.
+func readNewSide(repoRoot string, staged bool, path string) ([]byte, error) {
+	if staged {
+		return catFileBlob(repoRoot, ":"+path)
+	}
+	return os.ReadFile(filepath.Join(repoRoot, path))
+}
+
+// readOldSide returns the base-revision blob for a path.
+func readOldSide(repoRoot, oldRev, path string) ([]byte, error) {
+	return catFileBlob(repoRoot, oldRev+":"+path)
+}
+
+func catFileBlob(repoRoot, spec string) ([]byte, error) {
+	return exec.Command("git", "-C", repoRoot, "cat-file", "blob", spec).Output()
+}
+
+// parseBlobSymbols parses in-memory content for a path into symbols, returning
+// nil when the content can't or shouldn't be parsed (too large, binary, or a
+// recognised-but-not-parseable language). Line numbers are 1-based, matching the
+// diff. CRLF is left intact (git and tree-sitter both count LF rows).
+func parseBlobSymbols(src []byte, path string) []symbols.Symbol {
+	if len(src) == 0 || len(src) > maxChangedParseBytes {
+		return nil
+	}
+	if bytes.IndexByte(src, 0) >= 0 {
+		return nil // binary
+	}
+	l := lang.Default.ForFile(path)
+	if l == nil || !l.Parseable() {
+		return nil
+	}
+	src = bytes.TrimPrefix(src, []byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM (does not shift rows)
+	res, err := parser.ParseBytes(src, path, l.Name)
+	if err != nil || res == nil {
+		return nil
+	}
+	return res.Symbols
+}
+
 // innermostChanged returns the most specific navigable definition containing
-// each changed line (smallest range wins, so a method is preferred over its
-// enclosing class), deduplicated by name. Function-local declarations
-// (variables, nested types) are skipped so a change inside a function body is
-// attributed to the function, not to whatever local sits on that line.
-func innermostChanged(syms []index.SymbolResult, lines map[int]bool) []index.SymbolResult {
+// each changed line (smallest range wins, so a method beats its enclosing
+// class), deduplicated by name. Function-local declarations are skipped so a
+// change inside a body is attributed to the function, not a local on that line.
+func innermostChanged(syms []symbols.Symbol, lines map[int]bool) []symbols.Symbol {
 	seen := map[string]bool{}
-	var out []index.SymbolResult
+	var out []symbols.Symbol
 	for line := range lines {
-		var best *index.SymbolResult
+		var best *symbols.Symbol
 		for i := range syms {
 			s := &syms[i]
-			if !isChangedUnit(*s) {
+			if !isChangedUnit(s.Kind, s.Depth) {
 				continue
 			}
 			if s.StartLine <= line && line <= s.EndLine {
@@ -400,27 +524,20 @@ func innermostChanged(syms []index.SymbolResult, lines map[int]bool) []index.Sym
 	return out
 }
 
-// isChangedUnit reports whether a symbol is a navigable definition worth
-// reporting as "changed" — something that can have references/callers.
-// Class members (methods, constructors) count at any depth; other definitions
-// only at the top level, which excludes function-local variables, constants,
-// and nested helper types that no external code can reference.
-func isChangedUnit(s index.SymbolResult) bool {
-	switch s.Kind {
+// isChangedUnit reports whether a (kind, depth) is a navigable definition worth
+// reporting as changed — something that can have references/callers. Functions
+// and methods count at any depth (Python and Rust emit methods as "function"
+// nested in a class/impl); other definitions only at the top level, which
+// excludes function-local variables, constants, and nested helper types.
+func isChangedUnit(kind string, depth int) bool {
+	switch kind {
 	case "function", "method", "constructor":
-		// Functions and methods at any depth. Python and Rust emit methods as
-		// kind "function" nested in a class/impl (depth > 0), and those are the
-		// real changed units — restricting "function" to depth 0 would
-		// mis-attribute every Python/Rust method to its enclosing type.
-		// Function-local closures are rare and acceptable noise by comparison.
 		return true
 	case "class", "struct", "interface", "type",
 		"enum", "trait", "protocol", "module", "impl":
-		return s.Depth == 0
+		return depth == 0
 	default:
-		// variables, constants, fields, parameters: navigable only at the top
-		// level; function-local declarations are not referenceable definitions.
-		return s.Depth == 0
+		return depth == 0
 	}
 }
 
