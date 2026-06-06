@@ -90,6 +90,26 @@ func TestFindImpactReportsTruncation(t *testing.T) {
 	}
 }
 
+func TestReferenceCountsWithScopeSplitsProductionAndTest(t *testing.T) {
+	db := newTriageRepo(t)
+
+	// target is called by ProdUser + AnotherProd (app.go) and TestTarget
+	// (app_test.go): 3 reference rows across 2 files, split 2 prod / 1 test.
+	rc, err := ReferenceCountsWithScope(db, "target", ResolveScopeFamily)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc.Rows != 3 || rc.Files != 2 {
+		t.Fatalf("counts = %d rows / %d files, want 3 / 2 (%+v)", rc.Rows, rc.Files, rc)
+	}
+	if rc.ProductionRows != 2 || rc.ProductionFiles != 1 {
+		t.Errorf("production = %d rows / %d files, want 2 / 1", rc.ProductionRows, rc.ProductionFiles)
+	}
+	if rc.TestRows != 1 || rc.TestFiles != 1 {
+		t.Errorf("test = %d rows / %d files, want 1 / 1", rc.TestRows, rc.TestFiles)
+	}
+}
+
 func TestClassifyImpactPathOfTestFile(t *testing.T) {
 	// Sanity: the test fixture's test file classifies as test.
 	if got := ClassifyPath(filepath.ToSlash("app_test.go")); got != PathClassTest {
