@@ -175,10 +175,12 @@ Examples:
 		if truncated {
 			meta = append(meta, kv{"truncated", "true"})
 		}
+		// Labeled "metrics" to match the JSON key (the spec's #4 block). Value is
+		// reference-row count split by class, "in" distinct-file count split.
 		if refErr {
-			meta = append(meta, kv{"references", "unavailable (lookup error)"})
+			meta = append(meta, kv{"metrics", "unavailable (lookup error)"})
 		} else {
-			meta = append(meta, kv{"references", fmt.Sprintf("%s in %s",
+			meta = append(meta, kv{"metrics", fmt.Sprintf("%s refs in %s files",
 				formatCallerCounts(refs.Rows, refs.ProductionRows, refs.TestRows, refs.UnknownRows),
 				formatCallerCounts(refs.Files, refs.ProductionFiles, refs.TestFiles, refs.UnknownFiles))})
 		}

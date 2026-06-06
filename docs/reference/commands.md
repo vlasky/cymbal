@@ -275,6 +275,99 @@ cymbal refs handleAuth --impact
 
 ---
 
+## `cymbal impact`
+
+Transitive caller analysis — what is impacted if a symbol changes.
+
+```sh
+cymbal impact <symbol> [symbol2 ...] [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-D, --depth <n>` | Max call-chain depth (max 5, default: 2) |
+| `-n, --limit <n>` | Max callers per symbol (default: 50) |
+| `--no-tests` | Exclude callers in test files (keeps production + unknown) |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+
+Callers are classified by file path as **production**, **test**, or **unknown**,
+so the header reports the real blast radius rather than a bare count:
+
+```sh
+$ cymbal impact Index --depth 1
+total_callers: 29 (5 production, 24 test)
+references: 39 (8 production, 31 test) in 12 (4 production, 8 test)
+```
+
+- `truncated: true` is shown (and emitted in `--json`) when a per-symbol
+  `--limit` was hit, so a partial caller set is never presented as complete.
+- The `references` line / JSON `metrics` block are exact, un-truncated counts of
+  references to the symbol (reference sites and distinct files, split by class) —
+  true breadth even when callers are capped. They are name-scoped: an ambiguous
+  name (several definitions) is flagged via `definition_count` / `definitions`.
+- `--no-tests` drops test-file callers; classification happens during traversal,
+  so test callers never consume the `--limit` budget ahead of production ones.
+
+```sh
+# only the production callers worth inspecting
+cymbal impact Index --no-tests
+```
+
+`trace` likewise reports `truncated` when its `--limit` is hit.
+
+---
+
+## `cymbal changed`
+
+Diff-scoped impact — map a git diff to the symbols it touches and report each
+one's references and transitive impact in a single call.
+
+```sh
+cymbal changed [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--staged` | Diff the staged changes (index vs HEAD) instead of the working tree |
+| `--base <ref>` | Diff the working tree against another single ref (e.g. `main`) |
+| `-D, --depth <n>` | Max call-chain depth for impact (max 5, default: 2) |
+| `-n, --limit <n>` | Max callers per changed symbol (default: 50) |
+| `--max-symbols <n>` | Max changed symbols to analyze (default: 40, 0 = unlimited) |
+| `--max-impact <n>` | Soft cap on total caller rows across symbols (default: 500) |
+| `--no-tests` | Exclude callers in test files from impact |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+
+Defaults to **unstaged** working-tree changes (`git diff`). Changed symbols are
+attributed by parsing the actual diffed blobs on both sides: added/modified lines
+map to symbols in the new version, deleted lines to symbols in the old version.
+So whole-symbol deletions are **named** (listed under `deleted`), `--staged`
+attribution matches the staged content even with unstaged edits present, and
+each changed line maps to its enclosing navigable definition.
+
+```sh
+# what does my uncommitted edit affect?
+$ cymbal changed
+changed_symbols: 1
+base: working tree
+---
+# ClassifyPath  (index/classify.go)
+  references: 6 (4 production, 2 test) in 6 (4 production, 2 test)
+  impact: 14 (12 production, 2 test) callers
+```
+
+```sh
+cymbal changed --staged        # staged changes (index vs HEAD)
+cymbal changed --base main     # working tree vs your branch point
+cymbal changed --json          # full structured payload for agents
+```
+
+Operates only on the current worktree. Counts are name-scoped (cymbal resolves
+references by name); arbitrary commit ranges (`a..b`) and deleted-symbol impact
+are out of scope. Deleted/binary/unsupported files are reported, not silently
+dropped.
+
+---
+
 ## `cymbal hook`
 
 Agent-integration helpers for session reminders, shell nudges, and supported

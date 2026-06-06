@@ -69,6 +69,71 @@ func TestChangedStagedVsUnstagedSeparation(t *testing.T) {
 	}
 }
 
+// TestChangedNamesDeletedSymbols proves the old-side attribution fix: deleting a
+// whole function names it under deleted_symbols, rather than mis-attributing the
+// deletion to a surviving neighbour.
+func TestChangedNamesDeletedSymbols(t *testing.T) {
+	t.Setenv("CYMBAL_CACHE_DIR", t.TempDir())
+	repo := t.TempDir()
+	writeFile(t, repo, "go.mod", "module example.com/del\n\ngo 1.25\n")
+	writeFile(t, repo, "p.go", "package p\n\nfunc Alpha() int { return 1 }\n\nfunc Beta() int { return 2 }\n\nfunc Gamma() int { return 3 }\n")
+	gitChanged(t, repo, "init")
+	gitChanged(t, repo, "add", ".")
+	gitChanged(t, repo, "-c", "user.name=x", "-c", "user.email=a@b.c", "commit", "-m", "init")
+	if _, err := index.Index(repo, "", index.Options{Workers: 1, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(index.CloseAll)
+
+	// Delete Beta entirely (unstaged), leaving Alpha and Gamma.
+	writeFile(t, repo, "p.go", "package p\n\nfunc Alpha() int { return 1 }\n\nfunc Gamma() int { return 3 }\n")
+
+	var stdout string
+	withWorkingDir(t, repo, func() {
+		out, _, err := captureProcessOutput(t, func() error {
+			rootCmd.SetArgs([]string{"changed", "--json"})
+			defer func() {
+				rootCmd.SetArgs(nil)
+				_ = rootCmd.PersistentFlags().Set("json", "false")
+			}()
+			return rootCmd.Execute()
+		})
+		if err != nil {
+			t.Fatalf("changed --json: %v", err)
+		}
+		stdout = out
+	})
+
+	var env struct {
+		Results struct {
+			Deleted []struct {
+				Symbol string `json:"symbol"`
+			} `json:"deleted_symbols"`
+			Results []struct {
+				Symbol string `json:"symbol"`
+			} `json:"results"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &env); err != nil {
+		t.Fatalf("parse changed json: %v\n%s", err, stdout)
+	}
+	found := false
+	for _, d := range env.Results.Deleted {
+		if d.Symbol == "Beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected Beta under deleted_symbols, got: %s", stdout)
+	}
+	// Beta must NOT be mis-reported as a changed (modified) symbol.
+	for _, r := range env.Results.Results {
+		if r.Symbol == "Beta" {
+			t.Errorf("deleted Beta should not appear as a changed symbol")
+		}
+	}
+}
+
 // TestChangedEndToEnd exercises the full pipeline: real git diff -> changed-line
 // attribution -> per-symbol references + impact, via the CLI.
 func TestChangedEndToEnd(t *testing.T) {
