@@ -71,7 +71,8 @@ Examples:
 			entry, _ := findSymbolEntry(plan, name)
 			return entry.Path
 		}
-		refs, defCount := aggregateReferences(names, scope, dbForName)
+		refs, refErr := aggregateReferences(names, scope, dbForName)
+		defsByName, defCount, defErr := collectDefinitions(names, dbForName)
 		effDepth, effLimit := index.ClampImpactBounds(depth, limit)
 
 		if jsonOut {
@@ -95,13 +96,22 @@ Examples:
 				"truncated":          truncated,
 				"depth":              effDepth,
 				"limit":              effLimit,
-				"references":         refs,
+				"metrics":            refs, // #4: exact, name-scoped reference metrics (no risk label)
 				"definition_count":   defCount,
 				"resolve_scope":      string(scope),
 				"results":            out,
 			}
 			if unknownN > 0 {
 				payload["unknown_callers"] = unknownN
+			}
+			if refErr {
+				payload["references_error"] = true // counts may be incomplete; not authoritative
+			}
+			if defErr {
+				payload["definition_count_error"] = true
+			}
+			if defCount > len(names) { // at least one name is ambiguous
+				payload["definitions"] = defsByName
 			}
 			if len(ambig) > 0 {
 				payload["symbol_languages"] = ambig
@@ -165,9 +175,13 @@ Examples:
 		if truncated {
 			meta = append(meta, kv{"truncated", "true"})
 		}
-		meta = append(meta, kv{"references", fmt.Sprintf("%s in %s",
-			formatCallerCounts(refs.Rows, refs.ProductionRows, refs.TestRows, refs.UnknownRows),
-			formatCallerCounts(refs.Files, refs.ProductionFiles, refs.TestFiles, refs.UnknownFiles))})
+		if refErr {
+			meta = append(meta, kv{"references", "unavailable (lookup error)"})
+		} else {
+			meta = append(meta, kv{"references", fmt.Sprintf("%s in %s",
+				formatCallerCounts(refs.Rows, refs.ProductionRows, refs.TestRows, refs.UnknownRows),
+				formatCallerCounts(refs.Files, refs.ProductionFiles, refs.TestFiles, refs.UnknownFiles))})
+		}
 		// More definitions than requested names means at least one name is
 		// ambiguous: impact and reference counts are name-scoped and may span
 		// those definitions.
@@ -286,24 +300,59 @@ func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, 
 // symbols and returns the total definition count (a name with several
 // definitions makes the name-scoped counts span them — surfaced as an ambiguity
 // signal). dbForName routes each name to whichever federated DB owns it.
-func aggregateReferences(names []string, scope index.ResolveScope, dbForName func(string) string) (index.ReferenceCounts, int) {
+func aggregateReferences(names []string, scope index.ResolveScope, dbForName func(string) string) (counts index.ReferenceCounts, refErr bool) {
 	// Merge per-file row counts across seeds before folding, so a file that
 	// references more than one requested symbol is counted once in the distinct
 	// referencing-file totals (summing per-symbol counts would double-count it).
 	merged := map[string]int{}
-	defs := 0
 	for _, name := range names {
-		db := dbForName(name)
-		if perFile, err := index.ReferenceFileCountsWithScope(db, name, scope); err == nil {
+		if perFile, err := index.ReferenceFileCountsWithScope(dbForName(name), name, scope); err == nil {
 			for rel, c := range perFile {
 				merged[rel] += c
 			}
-		}
-		if syms, err := index.SymbolsByName(db, name); err == nil {
-			defs += len(syms)
+		} else {
+			refErr = true
 		}
 	}
-	return index.FoldReferenceCounts(merged), defs
+	return index.FoldReferenceCounts(merged), refErr
+}
+
+// defLoc is one indexed definition of a name (for ambiguity reporting).
+type defLoc struct {
+	Path      string `json:"path"`
+	Language  string `json:"language"`
+	StartLine int    `json:"start_line"`
+}
+
+// symbolDefinitions returns a name's indexed definition locations; ok is false
+// if the lookup itself failed (distinct from a name with zero definitions).
+func symbolDefinitions(dbPath, name string) (locs []defLoc, ok bool) {
+	syms, err := index.SymbolsByName(dbPath, name)
+	if err != nil {
+		return nil, false
+	}
+	for _, s := range syms {
+		locs = append(locs, defLoc{Path: s.RelPath, Language: s.Language, StartLine: s.StartLine})
+	}
+	return locs, true
+}
+
+// collectDefinitions gathers per-seed definition locations across names. defErr
+// is true if any lookup failed (so a zero count isn't mistaken for "no defs").
+func collectDefinitions(names []string, dbForName func(string) string) (byName map[string][]defLoc, total int, defErr bool) {
+	byName = map[string][]defLoc{}
+	for _, name := range names {
+		locs, ok := symbolDefinitions(dbForName(name), name)
+		if !ok {
+			defErr = true
+			continue
+		}
+		if len(locs) > 0 {
+			byName[name] = locs
+			total += len(locs)
+		}
+	}
+	return byName, total, defErr
 }
 
 // classifyImpact splits a caller set into production / test / unknown counts by

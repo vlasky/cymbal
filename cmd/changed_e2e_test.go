@@ -17,6 +17,58 @@ func gitChanged(t *testing.T, repo string, args ...string) {
 	}
 }
 
+// TestChangedStagedVsUnstagedSeparation proves the two-blob fix: a staged edit
+// and an unrelated unstaged edit in the same file are attributed to the right
+// mode (default = unstaged only; --staged = staged only).
+func TestChangedStagedVsUnstagedSeparation(t *testing.T) {
+	t.Setenv("CYMBAL_CACHE_DIR", t.TempDir())
+	repo := t.TempDir()
+	writeFile(t, repo, "go.mod", "module example.com/sep\n\ngo 1.25\n")
+	writeFile(t, repo, "p.go", "package p\n\nfunc Alpha() int { return 1 }\n\nfunc Gamma() int { return 3 }\n")
+	gitChanged(t, repo, "init")
+	gitChanged(t, repo, "add", ".")
+	gitChanged(t, repo, "-c", "user.name=x", "-c", "user.email=a@b.c", "commit", "-m", "init")
+	if _, err := index.Index(repo, "", index.Options{Workers: 1, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(index.CloseAll)
+
+	// Stage an edit to Alpha; leave an unrelated edit to Gamma unstaged.
+	writeFile(t, repo, "p.go", "package p\n\nfunc Alpha() int { return 111 }\n\nfunc Gamma() int { return 3 }\n")
+	gitChanged(t, repo, "add", "p.go")
+	writeFile(t, repo, "p.go", "package p\n\nfunc Alpha() int { return 111 }\n\nfunc Gamma() int { return 333 }\n")
+
+	run := func(args ...string) string {
+		var out string
+		withWorkingDir(t, repo, func() {
+			s, _, err := captureProcessOutput(t, func() error {
+				rootCmd.SetArgs(args)
+				defer func() {
+					rootCmd.SetArgs(nil)
+					// cobra retains parsed flag values across Execute calls;
+					// reset what we set so later tests aren't polluted.
+					_ = changedCmd.Flags().Set("staged", "false")
+					_ = changedCmd.Flags().Set("base", "")
+					_ = rootCmd.PersistentFlags().Set("json", "false")
+				}()
+				return rootCmd.Execute()
+			})
+			if err != nil {
+				t.Fatalf("%v: %v", args, err)
+			}
+			out = s
+		})
+		return out
+	}
+
+	if def := run("changed"); !strings.Contains(def, "# Gamma") || strings.Contains(def, "# Alpha") {
+		t.Errorf("default (unstaged) should report Gamma only, got:\n%s", def)
+	}
+	if st := run("changed", "--staged"); !strings.Contains(st, "# Alpha") || strings.Contains(st, "# Gamma") {
+		t.Errorf("--staged should report Alpha only, got:\n%s", st)
+	}
+}
+
 // TestChangedEndToEnd exercises the full pipeline: real git diff -> changed-line
 // attribution -> per-symbol references + impact, via the CLI.
 func TestChangedEndToEnd(t *testing.T) {
@@ -90,8 +142,8 @@ func Caller() {
 		t.Fatalf("parse changed json: %v\n%s", err, stdout)
 	}
 	r := env.Results
-	if r.Base != "HEAD" {
-		t.Errorf("base = %q, want HEAD", r.Base)
+	if r.Base != "working tree" {
+		t.Errorf("base = %q, want \"working tree\" (default unstaged mode)", r.Base)
 	}
 	var caller *struct {
 		Symbol     string `json:"symbol"`

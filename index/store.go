@@ -1542,11 +1542,30 @@ func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) 
 
 // FindTraceWithOptions is FindTrace with explicit control over filtering behavior.
 func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
+	results, _, err := s.findTraceWithOptions(symbolName, depth, limit, opts, kinds...)
+	return results, err
+}
+
+// findTraceWithOptions is the trace BFS core; the bool reports whether the
+// per-query limit truncated the result set. Truncation is detected by
+// over-fetching one row past the limit, then trimming — but only on the normal
+// path. The graph builder exempts unresolved rows from the limit
+// (UnresolvedExemptFromLimit), where len(results) legitimately exceeds limit, so
+// it is neither over-fetched nor trimmed.
+func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, bool, error) {
 	if depth <= 0 {
 		depth = 3
 	}
 	if depth > 5 {
 		depth = 5
+	}
+	if limit <= 0 {
+		limit = defaultImpactLimit
+	}
+	overfetch := !opts.UnresolvedExemptFromLimit
+	budget := limit
+	if overfetch {
+		budget = limit + 1
 	}
 	if len(kinds) == 0 {
 		kinds = []string{symbols.RefKindCall}
@@ -1638,7 +1657,7 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 	// to their caller's resolution scope below.
 	currentLocs := resolveSymbol(symbolName, nil)
 
-	for d := 1; d <= depth && len(currentLocs) > 0 && limited < limit; d++ {
+	for d := 1; d <= depth && len(currentLocs) > 0 && limited < budget; d++ {
 		var nextLocs []symLoc
 		for _, loc := range currentLocs {
 			callees := calleesOf(loc)
@@ -1678,8 +1697,13 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 				// they can't starve resolved traversal within the limit.
 				if resolved || !opts.UnresolvedExemptFromLimit {
 					limited++
-					if limited >= limit {
-						return results, nil
+					if limited >= budget {
+						if overfetch {
+							// We collected one past the limit, so a further
+							// callee genuinely exists: report truncation.
+							return results[:limit], true, nil
+						}
+						return results, false, nil
 					}
 				}
 			}
@@ -1687,7 +1711,7 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 		currentLocs = nextLocs
 	}
 
-	return results, nil
+	return results, false, nil
 }
 
 // SymbolLanguages returns the distinct languages of indexed symbols with the

@@ -1,13 +1,50 @@
 package cmd
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/1broseidon/cymbal/index"
 	"github.com/1broseidon/cymbal/symbols"
 )
+
+// BenchmarkParseChangedFiles measures diff parsing on a large changeset
+// (200 files x 5 hunks) — the per-diff scaling cost of `cymbal changed`.
+func BenchmarkParseChangedFiles(b *testing.B) {
+	var sb strings.Builder
+	for f := 0; f < 200; f++ {
+		fmt.Fprintf(&sb, "diff --git a/file%d.go b/file%d.go\n--- a/file%d.go\n+++ b/file%d.go\n", f, f, f, f)
+		for h := 0; h < 5; h++ {
+			start := h*20 + 1
+			fmt.Fprintf(&sb, "@@ -%d,3 +%d,4 @@\n ctx\n+added one\n+added two\n ctx\n", start, start)
+		}
+	}
+	diff := sb.String()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = parseChangedFiles(diff)
+	}
+}
+
+// BenchmarkParseBlobSymbols measures the on-demand parse cost for one large
+// source blob (500 functions), the dominant per-file cost in `cymbal changed`.
+func BenchmarkParseBlobSymbols(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString("package p\n")
+	for i := 0; i < 500; i++ {
+		fmt.Fprintf(&sb, "func F%d() int { x := %d; return x }\n", i, i)
+	}
+	src := []byte(sb.String())
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := parseBlobSymbols(src, "p.go"); !ok {
+			b.Fatal("parse failed")
+		}
+	}
+}
 
 func TestParseChangedFilesTracksOldAndNewLines(t *testing.T) {
 	diff := `diff --git a/foo.go b/foo.go
@@ -154,27 +191,38 @@ func TestAggregateReferencesSumsAcrossSeeds(t *testing.T) {
 	_, dbPath := newPhase2Repo(t)
 	db := func(string) string { return dbPath }
 
-	// helper is called from multiple sites; Shared from one. Aggregating both
-	// seeds should sum their reference rows and definition counts.
-	one, defsOne := aggregateReferences([]string{"helper"}, index.ResolveScopeFamily, db)
+	one, refErr := aggregateReferences([]string{"helper"}, index.ResolveScopeFamily, db)
+	if refErr {
+		t.Fatalf("unexpected reference error")
+	}
 	if one.Rows == 0 {
 		t.Fatalf("expected helper to have references, got %+v", one)
 	}
-	if defsOne != 1 {
-		t.Errorf("helper definition_count = %d, want 1", defsOne)
-	}
 
-	both, defsBoth := aggregateReferences([]string{"helper", "Shared"}, index.ResolveScopeFamily, db)
+	both, _ := aggregateReferences([]string{"helper", "Shared"}, index.ResolveScopeFamily, db)
 	if both.Rows <= one.Rows {
 		t.Errorf("aggregate rows for {helper,Shared} (%d) should exceed helper alone (%d)", both.Rows, one.Rows)
-	}
-	if defsBoth != 2 {
-		t.Errorf("combined definition_count = %d, want 2", defsBoth)
 	}
 	// helper and Shared are both referenced from main.go. Distinct referencing
 	// files must dedup to 1 — summing per-symbol file counts would give 2.
 	if both.Files != 1 {
 		t.Errorf("distinct referencing_files = %d, want 1 (no double-count of shared file)", both.Files)
+	}
+}
+
+func TestCollectDefinitionsCountsAndGroups(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	db := func(string) string { return dbPath }
+
+	byName, total, defErr := collectDefinitions([]string{"helper", "Shared"}, db)
+	if defErr {
+		t.Fatalf("unexpected definition lookup error")
+	}
+	if total != 2 {
+		t.Errorf("combined definition count = %d, want 2", total)
+	}
+	if len(byName["helper"]) != 1 || len(byName["Shared"]) != 1 {
+		t.Errorf("expected one definition each, got %+v", byName)
 	}
 }
 

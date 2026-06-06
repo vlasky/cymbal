@@ -61,19 +61,17 @@ func SymbolScore(r SymbolResult) int {
 		score += 10
 	}
 
-	// Penalise test paths.
-	for _, seg := range []string{
-		"/test/", "/tests/", "/testing/",
-		"_test.go", "_test.", "_spec.", ".test.", ".spec.",
-		"/testdata/", "/testutil/", "/testutils/",
-	} {
-		if strings.Contains(p, seg) {
-			score -= 80
-			break
-		}
+	// Penalise test files. Shares the single ClassifyPath definition of "test"
+	// so the two never drift, and so top-level test dirs (e.g. `tests/foo.py`,
+	// `spec/x.rb`) — which the old "/test/"-anchored list missed — are caught.
+	if ClassifyPath(r.RelPath) == PathClassTest {
+		score -= 80
 	}
-	// Penalise playground / example paths.
+	// Penalise test-support / playground / example / fixture paths. These are
+	// ClassifyPath "unknown" (kept by --no-tests) but still non-canonical for
+	// ranking, so they keep their own penalty here.
 	for _, seg := range []string{
+		"/testing/", "/testutil/", "/testutils/",
 		"/playground/", "/example/", "/examples/",
 		"/demo/", "/demos/", "/sample/", "/samples/",
 		"/fixture/", "/fixtures/",

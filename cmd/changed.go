@@ -87,8 +87,15 @@ when truncated. Operates only on the current worktree.`,
 			}
 		}
 
-		oldRev := "HEAD"
-		if base != "" {
+		// Old-side blob revision per mode: index ("" -> :path) for the default
+		// unstaged diff, HEAD for --staged, the ref for --base. This matches the
+		// old side git diff itself compares against, so old-side line numbers
+		// align with the parsed old blob.
+		oldRev := "" // default: the index (unstaged diff compares working tree vs index)
+		switch {
+		case staged:
+			oldRev = "HEAD"
+		case base != "":
 			oldRev = base
 		}
 
@@ -179,6 +186,9 @@ when truncated. Operates only on the current worktree.`,
 			Symbol          string                `json:"symbol"`
 			Files           []string              `json:"files"`
 			DefinitionCount int                   `json:"definition_count"`
+			Definitions     []defLoc              `json:"definitions,omitempty"`
+			Ambiguous       bool                  `json:"ambiguous,omitempty"`
+			DefinitionError bool                  `json:"definition_error,omitempty"`
 			References      index.ReferenceCounts `json:"references"`
 			ReferencesError bool                  `json:"references_error,omitempty"`
 			Impact          *impactSummary        `json:"impact,omitempty"`
@@ -189,8 +199,14 @@ when truncated. Operates only on the current worktree.`,
 		aggRows := 0
 		for _, name := range analyzed {
 			res := changedResult{Symbol: name, Files: sortedKeys(changed[name])}
-			if syms, derr := index.SymbolsByName(dbPath, name); derr == nil {
-				res.DefinitionCount = len(syms)
+			if locs, ok := symbolDefinitions(dbPath, name); ok {
+				res.DefinitionCount = len(locs)
+				res.Ambiguous = len(locs) > 1
+				if res.Ambiguous {
+					res.Definitions = locs
+				}
+			} else {
+				res.DefinitionError = true
 			}
 			if rc, rerr := index.ReferenceCountsWithScope(dbPath, name, scope); rerr == nil {
 				res.References = rc
@@ -212,9 +228,13 @@ when truncated. Operates only on the current worktree.`,
 					Truncated:         tr,
 				}
 				aggRows += len(rows)
-				if tr || (aggLimit > 0 && aggRows >= aggLimit) {
+				if tr {
 					impactTruncated = true
 				}
+				// Note: reaching the aggregate cap here is NOT truncation by
+				// itself — truncated is set only when a later symbol is actually
+				// skipped (the "cap" branch above), so it never fires when the
+				// cap is hit exactly on the final symbol with nothing omitted.
 			}
 			results = append(results, res)
 		}
@@ -341,6 +361,10 @@ func init() {
 // changedDiffArgs builds the git-diff argument list for the requested mode and a
 // human label for the comparison base. core.quotePath=false reduces path
 // escaping; remaining C-quoted paths are decoded when parsed.
+//
+//   default:  git diff           — unstaged: working tree vs index
+//   --staged: git diff --cached  — staged:   index vs HEAD
+//   --base R: git diff R         — working tree vs ref R
 func changedDiffArgs(staged bool, base string) ([]string, string, error) {
 	common := []string{"-c", "core.quotePath=false", "diff", "--no-ext-diff", "--find-renames"}
 	switch {
@@ -352,9 +376,14 @@ func changedDiffArgs(staged bool, base string) ([]string, string, error) {
 		if strings.HasPrefix(base, "-") {
 			return nil, "", fmt.Errorf("invalid base ref %q", base)
 		}
+		if strings.Contains(base, "..") {
+			// An arbitrary commit range's new side isn't the working tree, so
+			// parsing the working tree as "new" would misattribute. Out of scope.
+			return nil, "", fmt.Errorf("--base takes a single ref, not a range (%q)", base)
+		}
 		return append(common, base), base, nil
 	default:
-		return append(common, "HEAD"), "HEAD", nil
+		return common, "working tree", nil
 	}
 }
 

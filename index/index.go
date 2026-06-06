@@ -1188,14 +1188,21 @@ func FindTrace(dbPath, symbolName string, depth, limit int, kinds ...string) ([]
 
 // FindTraceWithOptions is FindTrace with explicit control over filtering.
 func FindTraceWithOptions(dbPath, symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
+	rows, _, err := FindTraceWithTruncation(dbPath, symbolName, depth, limit, opts, kinds...)
+	return rows, err
+}
+
+// FindTraceWithTruncation is FindTraceWithOptions that also reports whether the
+// per-query limit truncated the result set (detected by over-fetching one row).
+func FindTraceWithTruncation(dbPath, symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, bool, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	store, err := openCached(dbPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return store.FindTraceWithOptions(symbolName, depth, limit, opts, kinds...)
+	return store.findTraceWithOptions(symbolName, depth, limit, opts, kinds...)
 }
 
 // BuildGraph renders symbol relationships as a graph from an opened DB.
