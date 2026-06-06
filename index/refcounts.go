@@ -36,9 +36,22 @@ type ReferenceCounts struct {
 // family-expansion impact/trace use. With ResolveScopeAll (or when the symbol
 // has no indexed language) it counts across all languages.
 func ReferenceCountsWithScope(dbPath, symbolName string, scope ResolveScope) (ReferenceCounts, error) {
-	store, err := openCached(dbPath)
+	perFile, err := ReferenceFileCountsWithScope(dbPath, symbolName, scope)
 	if err != nil {
 		return ReferenceCounts{}, err
+	}
+	return FoldReferenceCounts(perFile), nil
+}
+
+// ReferenceFileCountsWithScope returns the per-file reference-row counts
+// (rel_path -> count) for symbolName within the resolution scope. Callers that
+// aggregate over several symbols should merge these maps by rel_path before
+// folding, so a file referencing more than one symbol is counted once — summing
+// per-symbol ReferenceCounts would double-count shared files.
+func ReferenceFileCountsWithScope(dbPath, symbolName string, scope ResolveScope) (map[string]int, error) {
+	store, err := openCached(dbPath)
+	if err != nil {
+		return nil, err
 	}
 	var langs []string
 	if NormalizeScope(scope) != ResolveScopeAll {
@@ -46,13 +59,34 @@ func ReferenceCountsWithScope(dbPath, symbolName string, scope ResolveScope) (Re
 			langs = scopeLanguagesUnion(seedLangs, scope)
 		}
 	}
-	return store.referenceCounts(symbolName, langs)
+	return store.referenceFileCounts(symbolName, langs)
 }
 
-// referenceCounts groups reference rows by file (so the row scan is bounded by
-// referencing-file count, not total reference count), then classifies each file
-// path and tallies rows and distinct files per class.
-func (s *Store) referenceCounts(name string, langs []string) (ReferenceCounts, error) {
+// FoldReferenceCounts classifies each referencing file path and tallies rows
+// and distinct files per production/test/unknown class.
+func FoldReferenceCounts(perFile map[string]int) ReferenceCounts {
+	var rc ReferenceCounts
+	for relPath, c := range perFile {
+		rc.Rows += c
+		rc.Files++
+		switch ClassifyPath(relPath) {
+		case PathClassTest:
+			rc.TestRows += c
+			rc.TestFiles++
+		case PathClassUnknown:
+			rc.UnknownRows += c
+			rc.UnknownFiles++
+		default:
+			rc.ProductionRows += c
+			rc.ProductionFiles++
+		}
+	}
+	return rc
+}
+
+// referenceFileCounts groups reference rows by file (so the row scan is bounded
+// by referencing-file count, not total reference count).
+func (s *Store) referenceFileCounts(name string, langs []string) (map[string]int, error) {
 	langFilter := ""
 	args := []interface{}{name}
 	if len(langs) > 0 {
@@ -70,30 +104,18 @@ func (s *Store) referenceCounts(name string, langs []string) (ReferenceCounts, e
 		WHERE r.name = ?`+langFilter+`
 		GROUP BY f.rel_path`, args...)
 	if err != nil {
-		return ReferenceCounts{}, err
+		return nil, err
 	}
 	defer rows.Close()
 
-	var rc ReferenceCounts
+	perFile := map[string]int{}
 	for rows.Next() {
 		var relPath string
 		var c int
 		if err := rows.Scan(&relPath, &c); err != nil {
 			continue
 		}
-		rc.Rows += c
-		rc.Files++
-		switch ClassifyPath(relPath) {
-		case PathClassTest:
-			rc.TestRows += c
-			rc.TestFiles++
-		case PathClassUnknown:
-			rc.UnknownRows += c
-			rc.UnknownFiles++
-		default:
-			rc.ProductionRows += c
-			rc.ProductionFiles++
-		}
+		perFile[relPath] += c
 	}
-	return rc, rows.Err()
+	return perFile, rows.Err()
 }

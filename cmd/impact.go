@@ -72,6 +72,7 @@ Examples:
 			return entry.Path
 		}
 		refs, defCount := aggregateReferences(names, scope, dbForName)
+		effDepth, effLimit := index.ClampImpactBounds(depth, limit)
 
 		if jsonOut {
 			enriched := enrichImpact(merged, ctx)
@@ -92,8 +93,8 @@ Examples:
 				"test_callers":       testN,
 				"raw_rows":           totalRaw,
 				"truncated":          truncated,
-				"depth":              depth,
-				"limit":              limit,
+				"depth":              effDepth,
+				"limit":              effLimit,
 				"references":         refs,
 				"definition_count":   defCount,
 				"resolve_scope":      string(scope),
@@ -156,7 +157,7 @@ Examples:
 		} else {
 			meta = append(meta, kv{"symbols", strings.Join(names, ",")})
 		}
-		meta = append(meta, kv{"depth", fmt.Sprintf("%d", depth)})
+		meta = append(meta, kv{"depth", fmt.Sprintf("%d", effDepth)})
 		if totalGroups < len(merged) {
 			meta = append(meta, kv{"groups", fmt.Sprintf("%d", totalGroups)})
 		}
@@ -286,25 +287,23 @@ func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, 
 // definitions makes the name-scoped counts span them — surfaced as an ambiguity
 // signal). dbForName routes each name to whichever federated DB owns it.
 func aggregateReferences(names []string, scope index.ResolveScope, dbForName func(string) string) (index.ReferenceCounts, int) {
-	var total index.ReferenceCounts
+	// Merge per-file row counts across seeds before folding, so a file that
+	// references more than one requested symbol is counted once in the distinct
+	// referencing-file totals (summing per-symbol counts would double-count it).
+	merged := map[string]int{}
 	defs := 0
 	for _, name := range names {
 		db := dbForName(name)
-		if rc, err := index.ReferenceCountsWithScope(db, name, scope); err == nil {
-			total.Rows += rc.Rows
-			total.Files += rc.Files
-			total.ProductionRows += rc.ProductionRows
-			total.TestRows += rc.TestRows
-			total.UnknownRows += rc.UnknownRows
-			total.ProductionFiles += rc.ProductionFiles
-			total.TestFiles += rc.TestFiles
-			total.UnknownFiles += rc.UnknownFiles
+		if perFile, err := index.ReferenceFileCountsWithScope(db, name, scope); err == nil {
+			for rel, c := range perFile {
+				merged[rel] += c
+			}
 		}
 		if syms, err := index.SymbolsByName(db, name); err == nil {
 			defs += len(syms)
 		}
 	}
-	return total, defs
+	return index.FoldReferenceCounts(merged), defs
 }
 
 // classifyImpact splits a caller set into production / test / unknown counts by

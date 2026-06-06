@@ -28,8 +28,11 @@ deleted file mode 100644
 @@ -1,2 +0,0 @@
 -a
 -b
+diff --git a/logo.png b/logo.png
+index 1111..2222 100644
+Binary files a/logo.png and b/logo.png differ
 `
-	touched, deleted := parseChangedFiles(diff)
+	touched, deleted, binary := parseChangedFiles(diff)
 
 	got := sortedInts(touched["foo.go"])
 	want := []int{11, 12, 21} // 11,12 added; 21 deletion anchor
@@ -42,6 +45,9 @@ deleted file mode 100644
 	}
 	if _, ok := touched["gone.go"]; ok {
 		t.Errorf("deleted file should not appear in touched set")
+	}
+	if binary != 1 {
+		t.Errorf("binary count = %d, want 1", binary)
 	}
 }
 
@@ -73,6 +79,7 @@ func TestIsChangedUnit(t *testing.T) {
 		want bool
 	}{
 		{index.SymbolResult{Kind: "function", Depth: 0}, true},
+		{index.SymbolResult{Kind: "function", Depth: 1}, true},  // Python/Rust method
 		{index.SymbolResult{Kind: "method", Depth: 1}, true},
 		{index.SymbolResult{Kind: "variable", Depth: 0}, true},  // top-level var
 		{index.SymbolResult{Kind: "variable", Depth: 1}, false}, // local var
@@ -107,6 +114,11 @@ func TestAggregateReferencesSumsAcrossSeeds(t *testing.T) {
 	}
 	if defsBoth != 2 {
 		t.Errorf("combined definition_count = %d, want 2", defsBoth)
+	}
+	// helper and Shared are both referenced from main.go. Distinct referencing
+	// files must dedup to 1 — summing per-symbol file counts would give 2.
+	if both.Files != 1 {
+		t.Errorf("distinct referencing_files = %d, want 1 (no double-count of shared file)", both.Files)
 	}
 }
 

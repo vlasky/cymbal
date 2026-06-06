@@ -90,6 +90,22 @@ func TestFindImpactReportsTruncation(t *testing.T) {
 	}
 }
 
+func TestFindImpactTruncationBoundary(t *testing.T) {
+	db := newTriageRepo(t)
+	// target has exactly 3 callers. At limit == caller count nothing is cut,
+	// so the over-fetch (limit+1) finds no extra row and truncated must be false.
+	rows, tr, err := FindImpactWithScope(db, "target", ResolveScopeFamily, 2, 3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr {
+		t.Errorf("limit equal to caller count should not report truncation")
+	}
+	if len(rows) != 3 {
+		t.Errorf("got %d rows, want 3", len(rows))
+	}
+}
+
 func TestReferenceCountsWithScopeSplitsProductionAndTest(t *testing.T) {
 	db := newTriageRepo(t)
 

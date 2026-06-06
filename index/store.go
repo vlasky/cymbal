@@ -1710,6 +1710,31 @@ func (s *Store) SymbolLanguages(name string) ([]string, error) {
 	return langs, rows.Err()
 }
 
+// Impact traversal bounds. These are the single source of truth for clamping
+// depth/limit; both the BFS core and the CLI (for reporting effective values)
+// derive from ClampImpactBounds so the two never drift.
+const (
+	defaultImpactDepth = 2
+	maxImpactDepth     = 5
+	defaultImpactLimit = 100
+)
+
+// ClampImpactBounds normalizes a requested (depth, limit) to the values the
+// impact BFS actually uses: depth into [1, maxImpactDepth] defaulting to
+// defaultImpactDepth, and a non-positive limit to defaultImpactLimit.
+func ClampImpactBounds(depth, limit int) (int, int) {
+	if depth <= 0 {
+		depth = defaultImpactDepth
+	}
+	if depth > maxImpactDepth {
+		depth = maxImpactDepth
+	}
+	if limit <= 0 {
+		limit = defaultImpactLimit
+	}
+	return depth, limit
+}
+
 // FindImpact performs transitive caller analysis using BFS, unrestricted by
 // language.
 func (s *Store) FindImpact(symbolName string, depth, limit int) ([]ImpactResult, error) {
@@ -1750,12 +1775,7 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 // caller direction tests are almost always terminal, so this rarely differs from
 // pruning; it is the safer default.
 func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
-	if depth <= 0 {
-		depth = 2
-	}
-	if depth > 5 {
-		depth = 5
-	}
+	depth, limit = ClampImpactBounds(depth, limit)
 
 	langFilter := ""
 	if len(langs) > 0 {

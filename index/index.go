@@ -1150,9 +1150,6 @@ func SymbolLanguages(dbPath, name string) ([]string, error) {
 // FindImpact performs transitive caller analysis for a symbol, unrestricted by
 // language.
 func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, error) {
-	if limit <= 0 {
-		limit = 100
-	}
 	store, err := openCached(dbPath)
 	if err != nil {
 		return nil, err
@@ -1170,9 +1167,6 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 // noTests drops test-file callers during traversal. The returned bool reports
 // whether the per-symbol limit truncated the result set.
 func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
-	if limit <= 0 {
-		limit = 100
-	}
 	store, err := openCached(dbPath)
 	if err != nil {
 		return nil, false, err
