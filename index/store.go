@@ -1559,10 +1559,12 @@ func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts T
 	if depth > 5 {
 		depth = 5
 	}
-	if limit <= 0 {
-		limit = defaultImpactLimit
-	}
-	overfetch := !opts.UnresolvedExemptFromLimit
+	// Over-fetch one past the limit to detect truncation — but only on the
+	// normal path with a positive limit. The graph builder exempts unresolved
+	// rows (UnresolvedExemptFromLimit) and must not be trimmed; a non-positive
+	// limit keeps its prior store-level meaning (no normalization here, so
+	// direct callers are unaffected — the package wrapper does its own clamp).
+	overfetch := !opts.UnresolvedExemptFromLimit && limit > 0
 	budget := limit
 	if overfetch {
 		budget = limit + 1

@@ -27,12 +27,12 @@ var changedCmd = &cobra.Command{
 	Long: `Map a git diff to the symbols it touches, then report each changed
 symbol's references and transitive impact in one call.
 
-By default it analyses the working tree against HEAD. Use --staged for the
-staged changes, or --base <ref> to diff the working tree against another ref
-(e.g. your branch point):
+By default it analyses unstaged working-tree changes (git diff). Use --staged
+for the staged changes, or --base <ref> to diff the working tree against another
+single ref (e.g. your branch point):
 
-  cymbal changed                 # working tree vs HEAD
-  cymbal changed --staged        # staged changes vs HEAD
+  cymbal changed                 # unstaged changes (working tree vs index)
+  cymbal changed --staged        # staged changes (index vs HEAD)
   cymbal changed --base main     # working tree vs main
 
 Changed symbols are attributed by parsing the actual diffed blobs on both sides:

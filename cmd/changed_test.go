@@ -214,7 +214,7 @@ func TestCollectDefinitionsCountsAndGroups(t *testing.T) {
 	_, dbPath := newPhase2Repo(t)
 	db := func(string) string { return dbPath }
 
-	byName, total, defErr := collectDefinitions([]string{"helper", "Shared"}, db)
+	byName, total, _, defErr := collectDefinitions([]string{"helper", "Shared"}, db)
 	if defErr {
 		t.Fatalf("unexpected definition lookup error")
 	}

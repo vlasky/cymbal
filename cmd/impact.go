@@ -72,7 +72,7 @@ Examples:
 			return entry.Path
 		}
 		refs, refErr := aggregateReferences(names, scope, dbForName)
-		defsByName, defCount, defErr := collectDefinitions(names, dbForName)
+		defsByName, defCount, ambiguous, defErr := collectDefinitions(names, dbForName)
 		effDepth, effLimit := index.ClampImpactBounds(depth, limit)
 
 		if jsonOut {
@@ -110,7 +110,7 @@ Examples:
 			if defErr {
 				payload["definition_count_error"] = true
 			}
-			if defCount > len(names) { // at least one name is ambiguous
+			if ambiguous { // at least one seed has multiple definitions
 				payload["definitions"] = defsByName
 			}
 			if len(ambig) > 0 {
@@ -182,10 +182,9 @@ Examples:
 				formatCallerCounts(refs.Rows, refs.ProductionRows, refs.TestRows, refs.UnknownRows),
 				formatCallerCounts(refs.Files, refs.ProductionFiles, refs.TestFiles, refs.UnknownFiles))})
 		}
-		// More definitions than requested names means at least one name is
-		// ambiguous: impact and reference counts are name-scoped and may span
-		// those definitions.
-		if defCount > len(names) {
+		// A seed with multiple definitions is ambiguous: impact and reference
+		// counts are name-scoped and may span those definitions.
+		if ambiguous {
 			meta = append(meta, kv{"definition_count", fmt.Sprintf("%d", defCount)})
 		}
 		meta = append(meta, kv{"resolve_scope", string(scope)})
@@ -337,9 +336,13 @@ func symbolDefinitions(dbPath, name string) (locs []defLoc, ok bool) {
 	return locs, true
 }
 
-// collectDefinitions gathers per-seed definition locations across names. defErr
-// is true if any lookup failed (so a zero count isn't mistaken for "no defs").
-func collectDefinitions(names []string, dbForName func(string) string) (byName map[string][]defLoc, total int, defErr bool) {
+// collectDefinitions gathers per-seed definition locations across names.
+// anyAmbiguous is true if any single seed has more than one definition (the
+// signal that name-scoped metrics may conflate definitions) — tracked per seed,
+// not via total > len(names), so an undefined seed can't mask a genuinely
+// ambiguous one. defErr is true if any lookup failed (so a zero count isn't
+// mistaken for "no defs").
+func collectDefinitions(names []string, dbForName func(string) string) (byName map[string][]defLoc, total int, anyAmbiguous, defErr bool) {
 	byName = map[string][]defLoc{}
 	for _, name := range names {
 		locs, ok := symbolDefinitions(dbForName(name), name)
@@ -350,9 +353,12 @@ func collectDefinitions(names []string, dbForName func(string) string) (byName m
 		if len(locs) > 0 {
 			byName[name] = locs
 			total += len(locs)
+			if len(locs) > 1 {
+				anyAmbiguous = true
+			}
 		}
 	}
-	return byName, total, defErr
+	return byName, total, anyAmbiguous, defErr
 }
 
 // classifyImpact splits a caller set into production / test / unknown counts by
