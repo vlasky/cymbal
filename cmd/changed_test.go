@@ -87,6 +87,29 @@ func TestIsChangedUnit(t *testing.T) {
 	}
 }
 
+func TestAggregateReferencesSumsAcrossSeeds(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	db := func(string) string { return dbPath }
+
+	// helper is called from multiple sites; Shared from one. Aggregating both
+	// seeds should sum their reference rows and definition counts.
+	one, defsOne := aggregateReferences([]string{"helper"}, index.ResolveScopeFamily, db)
+	if one.Rows == 0 {
+		t.Fatalf("expected helper to have references, got %+v", one)
+	}
+	if defsOne != 1 {
+		t.Errorf("helper definition_count = %d, want 1", defsOne)
+	}
+
+	both, defsBoth := aggregateReferences([]string{"helper", "Shared"}, index.ResolveScopeFamily, db)
+	if both.Rows <= one.Rows {
+		t.Errorf("aggregate rows for {helper,Shared} (%d) should exceed helper alone (%d)", both.Rows, one.Rows)
+	}
+	if defsBoth != 2 {
+		t.Errorf("combined definition_count = %d, want 2", defsBoth)
+	}
+}
+
 func sortedInts(m map[int]bool) []int {
 	out := make([]int, 0, len(m))
 	for k := range m {

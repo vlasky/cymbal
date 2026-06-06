@@ -67,6 +67,11 @@ Examples:
 
 		ambig := ambiguousSymbolLanguages(plan, names)
 		prodN, testN, unknownN := classifyImpact(merged)
+		dbForName := func(name string) string {
+			entry, _ := findSymbolEntry(plan, name)
+			return entry.Path
+		}
+		refs, defCount := aggregateReferences(names, scope, dbForName)
 
 		if jsonOut {
 			enriched := enrichImpact(merged, ctx)
@@ -87,6 +92,10 @@ Examples:
 				"test_callers":       testN,
 				"raw_rows":           totalRaw,
 				"truncated":          truncated,
+				"depth":              depth,
+				"limit":              limit,
+				"references":         refs,
+				"definition_count":   defCount,
 				"resolve_scope":      string(scope),
 				"results":            out,
 			}
@@ -154,6 +163,15 @@ Examples:
 		meta = append(meta, kv{"total_callers", formatCallerCounts(len(merged), prodN, testN, unknownN)})
 		if truncated {
 			meta = append(meta, kv{"truncated", "true"})
+		}
+		meta = append(meta, kv{"references", fmt.Sprintf("%s in %s",
+			formatCallerCounts(refs.Rows, refs.ProductionRows, refs.TestRows, refs.UnknownRows),
+			formatCallerCounts(refs.Files, refs.ProductionFiles, refs.TestFiles, refs.UnknownFiles))})
+		// More definitions than requested names means at least one name is
+		// ambiguous: impact and reference counts are name-scoped and may span
+		// those definitions.
+		if defCount > len(names) {
+			meta = append(meta, kv{"definition_count", fmt.Sprintf("%d", defCount)})
 		}
 		meta = append(meta, kv{"resolve_scope", string(scope)})
 		if s := formatSymbolLanguages(ambig); s != "" {
@@ -261,6 +279,32 @@ func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, 
 		}
 	}
 	return merged, sourceMap, seen, totalRaw, truncated, nil
+}
+
+// aggregateReferences sums exact, name-scoped reference counts across the seed
+// symbols and returns the total definition count (a name with several
+// definitions makes the name-scoped counts span them — surfaced as an ambiguity
+// signal). dbForName routes each name to whichever federated DB owns it.
+func aggregateReferences(names []string, scope index.ResolveScope, dbForName func(string) string) (index.ReferenceCounts, int) {
+	var total index.ReferenceCounts
+	defs := 0
+	for _, name := range names {
+		db := dbForName(name)
+		if rc, err := index.ReferenceCountsWithScope(db, name, scope); err == nil {
+			total.Rows += rc.Rows
+			total.Files += rc.Files
+			total.ProductionRows += rc.ProductionRows
+			total.TestRows += rc.TestRows
+			total.UnknownRows += rc.UnknownRows
+			total.ProductionFiles += rc.ProductionFiles
+			total.TestFiles += rc.TestFiles
+			total.UnknownFiles += rc.UnknownFiles
+		}
+		if syms, err := index.SymbolsByName(db, name); err == nil {
+			defs += len(syms)
+		}
+	}
+	return total, defs
 }
 
 // classifyImpact splits a caller set into production / test / unknown counts by
