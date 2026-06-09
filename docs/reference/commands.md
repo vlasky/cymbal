@@ -275,6 +275,75 @@ cymbal refs handleAuth --impact
 
 ---
 
+## `cymbal investigate`
+
+Kind-adaptive investigation — returns the right shape of context for whatever a
+symbol is, so you don't have to choose between `search`, `show`, `refs`, and
+`impact`.
+
+```sh
+cymbal investigate <symbol> [symbol2 ...] [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+
+What you get back depends on the symbol's kind:
+
+- function / method → source + callers + shallow impact
+- class / struct / type / interface → source + members + references
+- ambiguous name → auto-resolves to the best match and notes the alternatives
+
+Disambiguate with a file or parent hint (`config.go:Config`, `auth.Middleware`),
+and pass several names to investigate a batch.
+
+```sh
+cymbal investigate OpenStore
+cymbal investigate config.go:Config     # file hint
+cymbal investigate Foo Bar Baz          # batch
+```
+
+---
+
+## `cymbal trace`
+
+Downward call trace — what does this symbol call? Complementary to `impact`,
+which traces callers upward.
+
+```sh
+cymbal trace <symbol> [symbol2 ...] [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--depth <n>` | Max traversal depth (default: 3) |
+| `-n, --limit <n>` | Max results per symbol (default: 50) |
+| `--kinds <list>` | Comma-separated ref kinds to follow: `call`, `use`, `implements` (default: `call`) |
+| `--stdin` | Read additional symbol names (newline-separated) from stdin |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+| `--include-unresolved` | Keep callees that don't resolve to an indexed symbol (stdlib, third-party, builtins); dashed `ext:` nodes under `--graph` |
+| `--graph` | Render the call tree as a visual graph |
+| `--graph-format <fmt>` | `mermaid`, `dot`, or `json` (implies `--graph`) |
+| `--graph-limit <n>` | Cap the graph size by degree (0 for no cap) |
+
+By default `trace` follows only invocation edges (`call`) and drops callees that
+don't resolve to an indexed symbol. `--include-unresolved` keeps those external
+callees in the text/JSON output (and renders them as dashed `ext:` nodes under
+`--graph`). Like `impact`, `trace` reports `truncated` when a per-symbol
+`--limit` is hit. Pass several names (or pipe via `--stdin`) for the union of
+callees, deduplicated with a `hit_symbols` attribution list.
+
+```sh
+cymbal trace handleRegister                      # call chain (depth 3)
+cymbal trace handleRegister --depth 5            # deeper trace
+cymbal trace Save Load Delete                    # union of callees
+cymbal trace handleRegister --include-unresolved # keep stdlib/external calls
+cymbal outline svc.go -s --names | cymbal trace --stdin
+```
+
+---
+
 ## `cymbal impact`
 
 Transitive caller analysis — what is impacted if a symbol changes.
