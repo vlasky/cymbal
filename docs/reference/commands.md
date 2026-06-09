@@ -287,6 +287,7 @@ cymbal investigate <symbol> [symbol2 ...] [flags]
 
 | Flag | Description |
 |------|-------------|
+| `--stdin` | Read additional symbol names (newline-separated) from stdin |
 | `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
 
 What you get back depends on the symbol's kind:
@@ -296,12 +297,14 @@ What you get back depends on the symbol's kind:
 - ambiguous name → auto-resolves to the best match and notes the alternatives
 
 Disambiguate with a file or parent hint (`config.go:Config`, `auth.Middleware`),
-and pass several names to investigate a batch.
+and pass several names (or pipe newline-separated names via `--stdin`) to
+investigate a batch.
 
 ```sh
 cymbal investigate OpenStore
 cymbal investigate config.go:Config     # file hint
 cymbal investigate Foo Bar Baz          # batch
+cymbal outline svc.go -s --names | cymbal investigate --stdin
 ```
 
 ---

@@ -626,6 +626,52 @@ func TestCodecovCLIOutlineLsInvestigateRunEModes(t *testing.T) {
 	requireOutputContains(t, stderr, "MissingSymbol:")
 }
 
+// TestInvestigateStdinBatch proves investigate's RunE merges --stdin names with
+// positional args (deduping overlaps), so the piped-batch workflow advertised by
+// the SessionStart hook actually works end to end.
+func TestInvestigateStdinBatch(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	defer func() { os.Stdin = origStdin }()
+	// "Execute" overlaps the positional arg below and must collapse to one entry.
+	_, _ = stdinW.WriteString("Service\nExecute\n")
+	_ = stdinW.Close()
+
+	cmd := commandWithDB(dbPath)
+	addStdinFlag(cmd)
+	setTestFlag(t, cmd, "stdin", "true")
+
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return investigateCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both the positional symbol and the stdin-only symbol are investigated.
+	requireOutputContains(t, stdout, "symbol: Execute")
+	requireOutputContains(t, stdout, "symbol: Service")
+	requireOutputContains(t, stdout, "investigate: type") // Service is a type
+	// The overlapping "Execute" was deduped: its frontmatter appears exactly once.
+	if n := strings.Count(stdout, "symbol: Execute"); n != 1 {
+		t.Fatalf("expected deduped single Execute frontmatter, got %d", n)
+	}
+
+	// Relaxing Args to MinimumNArgs(0) must not let an empty invocation slip
+	// through: no positional args and no --stdin still errors cleanly.
+	_, _, err = captureProcessOutput(t, func() error {
+		return investigateCmd.RunE(commandWithDB(dbPath), nil)
+	})
+	if err == nil {
+		t.Fatal("expected investigate with no args and no --stdin to error")
+	}
+}
+
 func TestCodecovCLIRootDiffVersionUpdateRegressions(t *testing.T) {
 	t.Cleanup(index.CloseAll)
 	repo, dbPath := newPhase2Repo(t)
