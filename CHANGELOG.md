@@ -4,6 +4,8 @@ All notable changes to cymbal are documented here.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-20
+
 ### Added
 
 - **Cross-language resolution scope for `trace` / `impact` / `investigate` / `changed`** — cymbal resolves references by name only (no receiver/type/import resolution), so a call could mis-resolve to a same-named symbol in an unrelated language. A new `--resolve-scope` flag (`same` | `family` | `all`, default `family`) constrains which languages a name resolves to, defaulting to the interop family of the symbol it resolves from so legitimate cross-language calls still resolve. Families: `jvm` (java/kotlin/scala), `js` (javascript/typescript/tsx), `c` (c/cpp); every other language scopes to itself. In `--graph` mode, an out-of-scope name collision is surfaced as a new `scope_filtered` entry in the `unresolved` diagnostics list (distinct from `external`), so the reason no edge was drawn is explicit. The active scope is reported as `resolve_scope` in frontmatter and JSON. An unknown `--resolve-scope` value is a hard error.
