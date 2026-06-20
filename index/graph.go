@@ -45,7 +45,13 @@ const (
 )
 
 const (
+	// GraphUnresolvedExternal: the callee resolves to no indexed symbol in any
+	// language (stdlib, third-party, or builtin).
 	GraphUnresolvedExternal GraphUnresolvedReason = "external"
+	// GraphUnresolvedScopeFiltered: the callee name exists in the index but
+	// only in a language outside the active resolution scope. Re-run with
+	// --resolve-scope all to traverse it.
+	GraphUnresolvedScopeFiltered GraphUnresolvedReason = "scope_filtered"
 )
 
 type GraphQuery struct {
@@ -55,6 +61,9 @@ type GraphQuery struct {
 	Scope             []string
 	Exclude           []string
 	IncludeUnresolved bool
+	// ResolveScope controls cross-language callee resolution (down/trace
+	// direction). Empty defaults to ResolveScopeFamily (see NormalizeScope).
+	ResolveScope ResolveScope
 	// Limit caps the graph at the top-N nodes by degree (edges touching
 	// the node). When >0 and the graph exceeds Limit, nodes are sorted
 	// by degree desc (stable tie-break: node ID asc), truncated, and a
@@ -70,6 +79,20 @@ type GraphNode struct {
 	Symbol   string        `json:"symbol,omitempty"`
 	Path     string        `json:"path,omitempty"`
 	Language string        `json:"language,omitempty"`
+	// DefinitionCount and Definitions annotate a node whose name is ambiguous
+	// — i.e. the index holds more than one symbol with this name. Because
+	// resolution is name-only, distinct same-named symbols collapse into this
+	// single node; the annotation lets a consumer see the conflation and
+	// investigate each definition. Both are omitted unless count > 1.
+	DefinitionCount int              `json:"definition_count,omitempty"`
+	Definitions     []GraphDefinition `json:"definitions,omitempty"`
+}
+
+// GraphDefinition locates one indexed definition of an ambiguous node's name.
+type GraphDefinition struct {
+	Path      string `json:"path,omitempty"`
+	Language  string `json:"language,omitempty"`
+	StartLine int    `json:"start_line,omitempty"`
 }
 
 type GraphEdge struct {
@@ -94,19 +117,82 @@ type GraphResult struct {
 	// Truncated reports how many nodes were dropped by the Limit cap.
 	// Zero when no truncation happened.
 	Truncated int `json:"truncated,omitempty"`
+	// ResolveScope is the active cross-language resolution scope (down/trace
+	// direction). Empty when not applicable (e.g. importer/impls graphs).
+	ResolveScope ResolveScope `json:"resolve_scope,omitempty"`
 }
 
 type graphSymbolMeta struct {
-	path     string
-	language string
+	path      string
+	language  string
+	startLine int
 }
 
 type graphBuilder struct {
 	q          GraphQuery
-	metas      map[string]graphSymbolMeta
+	metas      map[string][]graphSymbolMeta
 	nodes      map[string]GraphNode
 	edges      map[string]GraphEdge
 	unresolved map[string]GraphUnresolved
+}
+
+// metaVisible reports whether a definition's path passes the graph's
+// --graph-scope / --exclude globs. A path-less meta (e.g. a name with no
+// indexed definition) is treated as visible.
+func (b *graphBuilder) metaVisible(meta graphSymbolMeta) bool {
+	if meta.path == "" {
+		return true
+	}
+	if matchesAnyGlob(meta.path, b.q.Exclude) {
+		return false
+	}
+	if len(b.q.Scope) == 0 {
+		return true
+	}
+	return matchesAnyGlob(meta.path, b.q.Scope)
+}
+
+// classifyMeta inspects every indexed definition of name (restricted to
+// scopeLangs when non-empty) and reports three things, kept deliberately
+// separate:
+//
+//   - resolved: at least one definition matches the scope languages. This
+//     classifies cross-language collisions consistently with FindTrace (a name
+//     that exists only outside the scope is unresolved, not a spurious edge).
+//   - meta: the definition to display — a visible one when any matching
+//     definition is visible, otherwise the first scope-matching definition.
+//   - visible: at least one matching definition passes the scope/exclude globs.
+//
+// Resolution and visibility differ when a name resolves but every matching
+// definition is filtered by --exclude/--graph-scope: that yields no edge
+// (filtered out), not an external/scope_filtered diagnostic. Considering all
+// definitions — not just the first — is what fixes same-name collisions where
+// one definition is in scope and another is excluded.
+//
+// A name with no metadata is unresolved but path-less-visible, preserving the
+// prior behavior for call sites that gate only on visibility.
+func (b *graphBuilder) classifyMeta(name string, scopeLangs []string) (resolved bool, meta graphSymbolMeta, visible bool) {
+	metas := b.metas[name]
+	if len(metas) == 0 {
+		return false, graphSymbolMeta{}, true
+	}
+	var firstScoped graphSymbolMeta
+	haveScoped := false
+	for _, m := range metas {
+		if len(scopeLangs) > 0 && !inLangs(m.language, scopeLangs) {
+			continue
+		}
+		if !haveScoped {
+			firstScoped, haveScoped = m, true
+		}
+		if b.metaVisible(m) {
+			return true, m, true
+		}
+	}
+	if !haveScoped {
+		return false, graphSymbolMeta{}, false
+	}
+	return true, firstScoped, false
 }
 
 func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
@@ -122,7 +208,17 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 
 	builder := newGraphBuilder(q, metas)
 	if graphDirectionIncludesDown(q.Direction) {
-		rows, err := s.FindTrace(q.Symbol, q.Depth, 1000)
+		// Always collect unresolved callees so GraphResult.Unresolved
+		// diagnostics are populated regardless of q.IncludeUnresolved;
+		// addUnresolvedEdge gates whether ext: nodes/edges are actually
+		// rendered. UnresolvedExemptFromLimit makes the 1000 cap bound only
+		// resolved traversal breadth, so external/scope-filtered calls don't
+		// crowd it out — the unresolved diagnostics themselves are not capped.
+		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{
+			IncludeUnresolved:         true,
+			UnresolvedExemptFromLimit: true,
+			Scope:                     q.ResolveScope,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -130,7 +226,15 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 	}
 
 	if graphDirectionIncludesUp(q.Direction) {
-		rows, err := s.FindImpact(q.Symbol, q.Depth, 1000)
+		// Scope the upward caller traversal by the seed's language family so
+		// impact --graph matches the scoped impact text output.
+		var langs []string
+		if NormalizeScope(q.ResolveScope) != ResolveScopeAll {
+			if seedLangs, err := s.SymbolLanguages(q.Symbol); err == nil {
+				langs = scopeLanguagesUnion(seedLangs, q.ResolveScope)
+			}
+		}
+		rows, err := s.FindImpactInLangs(q.Symbol, langs, q.Depth, 1000)
 		if err != nil {
 			return nil, err
 		}
@@ -142,6 +246,8 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 	if q.Limit > 0 && len(result.Nodes) > q.Limit {
 		result = truncateByDegree(result, q.Limit, graphNodeID(q.Symbol))
 	}
+	// Set last so it survives builder.result and truncation.
+	result.ResolveScope = NormalizeScope(q.ResolveScope)
 	return result, nil
 }
 
@@ -166,7 +272,7 @@ func emptyGraphResult() *GraphResult {
 	}
 }
 
-func newGraphBuilder(q GraphQuery, metas map[string]graphSymbolMeta) *graphBuilder {
+func newGraphBuilder(q GraphQuery, metas map[string][]graphSymbolMeta) *graphBuilder {
 	return &graphBuilder{
 		q:          q,
 		metas:      metas,
@@ -207,17 +313,31 @@ func (b *graphBuilder) addTraceRows(rows []TraceResult) {
 }
 
 func (b *graphBuilder) addTraceRow(row TraceResult) {
-	fromMeta := b.metas[row.Caller]
-	if !b.includeSymbol(row.Caller, fromMeta) {
+	// The caller is drawn whenever it's visible (it's already a resolved
+	// trace symbol); an excluded/out-of-scope caller hard-cuts the row.
+	_, fromMeta, fromVisible := b.classifyMeta(row.Caller, nil)
+	if !fromVisible {
 		return
 	}
 	fromID := b.addNode(row.Caller, fromMeta, GraphNodeKindSymbol)
-	toMeta, ok := b.metas[row.Callee]
-	if !ok {
-		b.addUnresolvedEdge(fromID, row.Callee, "ext:"+row.Callee)
+	// Resolve the callee within the caller's resolution scope so a same-named
+	// symbol outside the scope doesn't yield a spurious resolved edge.
+	scopeLangs := scopeLanguages(row.Language, b.q.ResolveScope)
+	resolved, toMeta, visible := b.classifyMeta(row.Callee, scopeLangs)
+	if !resolved {
+		// Distinguish an out-of-scope name collision (exists in another
+		// language) from a genuinely external callee, so agents can tell why
+		// no edge was drawn and re-run with --resolve-scope all if needed.
+		reason := GraphUnresolvedExternal
+		if len(b.metas[row.Callee]) > 0 {
+			reason = GraphUnresolvedScopeFiltered
+		}
+		b.addUnresolvedEdge(fromID, row.Callee, "ext:"+row.Callee, reason)
 		return
 	}
-	if b.includeSymbol(row.Callee, toMeta) {
+	// Resolved but every matching definition is filtered by scope/exclude:
+	// no edge (intentional filter), not an unresolved diagnostic.
+	if visible {
 		toID := b.addNode(row.Callee, toMeta, GraphNodeKindSymbol)
 		b.addResolvedEdge(fromID, toID)
 	}
@@ -230,9 +350,11 @@ func (b *graphBuilder) addImpactRows(rows []ImpactResult) {
 }
 
 func (b *graphBuilder) addImpactRow(row ImpactResult) {
-	fromMeta, ok := b.metas[row.Caller]
-	toMeta := b.metas[row.Symbol]
-	if !ok || !b.includeSymbol(row.Caller, fromMeta) || !b.includeSymbol(row.Symbol, toMeta) {
+	// Caller must resolve and be visible; the target (already a resolved
+	// impact symbol) only needs to be visible.
+	fromResolved, fromMeta, fromVisible := b.classifyMeta(row.Caller, nil)
+	_, toMeta, toVisible := b.classifyMeta(row.Symbol, nil)
+	if !fromResolved || !fromVisible || !toVisible {
 		return
 	}
 	fromID := b.addNode(row.Caller, fromMeta, GraphNodeKindSymbol)
@@ -241,23 +363,10 @@ func (b *graphBuilder) addImpactRow(row ImpactResult) {
 }
 
 func (b *graphBuilder) addRoot() {
-	rootMeta, ok := b.metas[b.q.Symbol]
-	if ok && b.includeSymbol(b.q.Symbol, rootMeta) {
+	resolved, rootMeta, visible := b.classifyMeta(b.q.Symbol, nil)
+	if resolved && visible {
 		b.addNode(b.q.Symbol, rootMeta, GraphNodeKindSymbol)
 	}
-}
-
-func (b *graphBuilder) includeSymbol(symbol string, meta graphSymbolMeta) bool {
-	if meta.path == "" {
-		return true
-	}
-	if matchesAnyGlob(meta.path, b.q.Exclude) {
-		return false
-	}
-	if len(b.q.Scope) == 0 {
-		return true
-	}
-	return matchesAnyGlob(meta.path, b.q.Scope)
 }
 
 func (b *graphBuilder) addNode(symbol string, meta graphSymbolMeta, kind GraphNodeKind) string {
@@ -265,7 +374,7 @@ func (b *graphBuilder) addNode(symbol string, meta graphSymbolMeta, kind GraphNo
 	if _, ok := b.nodes[id]; ok {
 		return id
 	}
-	b.nodes[id] = GraphNode{
+	node := GraphNode{
 		ID:       id,
 		Kind:     kind,
 		Label:    symbol,
@@ -273,8 +382,31 @@ func (b *graphBuilder) addNode(symbol string, meta graphSymbolMeta, kind GraphNo
 		Path:     meta.path,
 		Language: meta.language,
 	}
+	// Annotate name collisions: a name-only node that maps to more than one
+	// indexed definition is conflated (this single node stands for all of
+	// them). Surface the count and locations so a consumer can disambiguate.
+	if defs := b.metas[symbol]; len(defs) > 1 {
+		node.DefinitionCount = len(defs)
+		listed := defs
+		if len(listed) > graphMaxDefinitionsListed {
+			listed = listed[:graphMaxDefinitionsListed]
+		}
+		node.Definitions = make([]GraphDefinition, 0, len(listed))
+		for _, d := range listed {
+			node.Definitions = append(node.Definitions, GraphDefinition{
+				Path:      d.path,
+				Language:  d.language,
+				StartLine: d.startLine,
+			})
+		}
+	}
+	b.nodes[id] = node
 	return id
 }
+
+// graphMaxDefinitionsListed caps the per-node Definitions list for pathological
+// names; DefinitionCount remains the authoritative total.
+const graphMaxDefinitionsListed = 20
 
 func (b *graphBuilder) addExternal(symbol string) string {
 	id := graphNodeID(symbol)
@@ -298,12 +430,12 @@ func (b *graphBuilder) addResolvedEdge(from, to string) {
 	b.edges[key] = GraphEdge{From: from, To: to, Kind: GraphEdgeKindCall, Resolved: true}
 }
 
-func (b *graphBuilder) addUnresolvedEdge(fromID, key, resolvedAs string) {
+func (b *graphBuilder) addUnresolvedEdge(fromID, key, resolvedAs string, reason GraphUnresolvedReason) {
 	ukey := fromID + "|" + resolvedAs
 	if _, ok := b.unresolved[ukey]; ok {
 		return
 	}
-	u := GraphUnresolved{From: fromID, Key: key, Reason: GraphUnresolvedExternal, ResolvedAs: resolvedAs}
+	u := GraphUnresolved{From: fromID, Key: key, Reason: reason, ResolvedAs: resolvedAs}
 	if b.q.IncludeUnresolved {
 		u.To = b.addExternal(resolvedAs)
 		b.edges[ukey] = GraphEdge{From: fromID, To: u.To, Kind: GraphEdgeKindCall, Resolved: false}
@@ -388,28 +520,46 @@ func truncateByDegree(g *GraphResult, limit int, rootID string) *GraphResult {
 	}
 }
 
-func (s *Store) symbolMetas() (map[string]graphSymbolMeta, error) {
+func (s *Store) symbolMetas() (map[string][]graphSymbolMeta, error) {
+	// All depths, not just top-level: methods and other nested symbols are
+	// legitimate call-graph nodes, and trace/impact resolve against every
+	// depth — restricting metadata to depth 0 made the graph mislabel real
+	// nested methods as external. Deterministic ordering (top-level first,
+	// then language/path/line) makes classifyMeta's selection stable: the
+	// first visible matching definition wins, and ambiguity annotations list
+	// the definitions in this order.
 	rows, err := s.db.Query(`
-		SELECT s.name, f.rel_path, s.language
+		SELECT s.name, f.rel_path, s.language, s.start_line
 		FROM symbols s
 		JOIN files f ON s.file_id = f.id
-		WHERE s.depth = 0
+		ORDER BY s.depth, s.language, f.rel_path, s.start_line
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := map[string]graphSymbolMeta{}
+	out := map[string][]graphSymbolMeta{}
 	for rows.Next() {
 		var name, relPath, language string
-		if err := rows.Scan(&name, &relPath, &language); err != nil {
+		var startLine int
+		if err := rows.Scan(&name, &relPath, &language, &startLine); err != nil {
 			continue
 		}
-		if _, ok := out[name]; ok {
-			continue
+		meta := graphSymbolMeta{path: filepath.ToSlash(relPath), language: language, startLine: startLine}
+		// Keep distinct definitions per name (used for ambiguity annotation)
+		// so callee resolution can match by language; drop exact duplicates
+		// such as the same symbol indexed across sibling worktrees.
+		dup := false
+		for _, m := range out[name] {
+			if m.language == meta.language && m.path == meta.path && m.startLine == meta.startLine {
+				dup = true
+				break
+			}
 		}
-		out[name] = graphSymbolMeta{path: filepath.ToSlash(relPath), language: language}
+		if !dup {
+			out[name] = append(out[name], meta)
+		}
 	}
 	return out, rows.Err()
 }

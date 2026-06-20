@@ -435,12 +435,12 @@ func TestPhase3CommandSearchShowInvestigateAndImporters(t *testing.T) {
 		t.Fatal("repoRootForPath should resolve indexed repo root")
 	}
 
-	investigated := investigateOne(dbPath, "execute")
+	investigated := investigateOne(dbPath, "execute", index.ResolveScopeFamily)
 	if investigated["fuzzy"] != true {
 		t.Fatalf("expected fuzzy investigate for lowercase execute: %+v", investigated)
 	}
 	stdout, _, err = captureProcessOutput(t, func() error {
-		return investigateOnePrint(dbPath, "Service", false, "")
+		return investigateOnePrint(dbPath, "Service", false, "", index.ResolveScopeFamily)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -753,4 +753,119 @@ func impactHasCaller(rows []index.ImpactResult, name string) bool {
 		}
 	}
 	return false
+}
+
+// TestTraceSingleSymbolJSONIsObjectWithScope verifies the unified JSON shape:
+// single-symbol trace --json is now the same object as multi-symbol, carrying
+// resolve_scope and results[].hit_symbols (no longer a bare array).
+func TestTraceSingleSymbolJSONIsObjectWithScope(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, cmd, "json", "true")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout), "[") {
+		t.Fatalf("single-symbol trace --json should be an object, got array: %s", stdout)
+	}
+	requireOutputContains(t, stdout, `"resolve_scope": "family"`)
+	requireOutputContains(t, stdout, `"results":`)
+	requireOutputContains(t, stdout, `"hit_symbols":`)
+}
+
+// TestImpactSingleSymbolJSONIsObjectWithScope mirrors the trace case for impact.
+func TestImpactSingleSymbolJSONIsObjectWithScope(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newImpactTestCommand(dbPath)
+	setTestFlag(t, cmd, "json", "true")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return impactCmd.RunE(cmd, []string{"helper"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout), "[") {
+		t.Fatalf("single-symbol impact --json should be an object, got array: %s", stdout)
+	}
+	requireOutputContains(t, stdout, `"resolve_scope": "family"`)
+	requireOutputContains(t, stdout, `"results":`)
+}
+
+// TestTraceGraphJSONHasResolveScope checks the graph JSON surfaces resolve_scope.
+func TestTraceGraphJSONHasResolveScope(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, cmd, "graph-format", "json")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOutputContains(t, stdout, `"resolve_scope": "family"`)
+}
+
+// TestTraceInvalidResolveScopeErrors checks an unknown --resolve-scope value is
+// a hard error rather than a silent family default.
+func TestTraceInvalidResolveScopeErrors(t *testing.T) {
+	_, dbPath := newPhase2Repo(t)
+	cmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, cmd, "resolve-scope", "bogus")
+	_, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(cmd, []string{"Execute"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid --resolve-scope") {
+		t.Fatalf("expected invalid --resolve-scope error, got %v", err)
+	}
+}
+
+// TestTraceSurfacesAmbiguousSymbolLanguages verifies that when a requested name
+// exists in more than one language, trace reports symbol_languages — and omits
+// it for an unambiguous seed.
+func TestTraceSurfacesAmbiguousSymbolLanguages(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("CYMBAL_CACHE_DIR", t.TempDir())
+	// 'Process' is defined in both Go and Python; 'Run' only in Go.
+	writeFile(t, repo, "a.go", "package a\nfunc Process() { Helper() }\nfunc Run() { Helper() }\nfunc Helper() {}\n")
+	writeFile(t, repo, "b.py", "def Process():\n    pass\n")
+	runGit(t, repo, "init")
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "-c", "user.name=T", "-c", "user.email=t@e.invalid", "commit", "-m", "x")
+	if _, err := index.Index(repo, "", index.Options{Workers: 1, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	dbPath, err := index.RepoDBPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(index.CloseAll)
+
+	// Ambiguous seed: symbol_languages present with both languages.
+	ambigCmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, ambigCmd, "json", "true")
+	stdout, _, err := captureProcessOutput(t, func() error {
+		return traceCmd.RunE(ambigCmd, []string{"Process"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOutputContains(t, stdout, `"symbol_languages"`)
+	requireOutputContains(t, stdout, `"go"`)
+	requireOutputContains(t, stdout, `"python"`)
+
+	// Unambiguous seed (Go-only 'Run'): no symbol_languages.
+	plainCmd := newTraceTestCommand(dbPath)
+	setTestFlag(t, plainCmd, "json", "true")
+	stdout, _, err = captureProcessOutput(t, func() error {
+		return traceCmd.RunE(plainCmd, []string{"Run"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout, "symbol_languages") {
+		t.Fatalf("unambiguous seed should omit symbol_languages, got:\n%s", stdout)
+	}
 }

@@ -16,6 +16,7 @@ package lang
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -36,6 +37,14 @@ type Language struct {
 	// Nil means the language is recognized for file classification / CLI
 	// heuristics only and is not parseable for symbol indexing.
 	TreeSitter *sitter.Language
+
+	// Family groups languages that interoperate — calls cross language
+	// boundaries within the group (e.g. JVM java/kotlin/scala, JS
+	// javascript/typescript/tsx, C c/cpp). Empty means the language has no
+	// known interop family and scopes to itself. Used by name-based
+	// resolution (trace/impact) to widen "same language" to "same family"
+	// without admitting unrelated cross-language name collisions.
+	Family string
 }
 
 // Parseable returns true if this language has a tree-sitter grammar.
@@ -45,19 +54,21 @@ func (l *Language) Parseable() bool {
 
 // Registry holds all known languages, indexed for fast lookup.
 type Registry struct {
-	langs  []*Language
-	byName map[string]*Language
-	byExt  map[string]*Language
-	byFile map[string]*Language
+	langs    []*Language
+	byName   map[string]*Language
+	byExt    map[string]*Language
+	byFile   map[string]*Language
+	byFamily map[string][]string // family key -> member language names (sorted)
 }
 
 // NewRegistry builds a registry from the given language definitions.
 // It panics on duplicate names, extensions, or filenames.
 func NewRegistry(langs ...Language) *Registry {
 	r := &Registry{
-		byName: make(map[string]*Language, len(langs)),
-		byExt:  make(map[string]*Language, len(langs)*3),
-		byFile: make(map[string]*Language, 8),
+		byName:   make(map[string]*Language, len(langs)),
+		byExt:    make(map[string]*Language, len(langs)*3),
+		byFile:   make(map[string]*Language, 8),
+		byFamily: make(map[string][]string, 4),
 	}
 	for i := range langs {
 		l := &langs[i]
@@ -66,6 +77,10 @@ func NewRegistry(langs ...Language) *Registry {
 		}
 		r.byName[l.Name] = l
 		r.langs = append(r.langs, l)
+
+		if l.Family != "" {
+			r.byFamily[l.Family] = append(r.byFamily[l.Family], l.Name)
+		}
 
 		for _, ext := range l.Extensions {
 			if !strings.HasPrefix(ext, ".") {
@@ -83,7 +98,30 @@ func NewRegistry(langs ...Language) *Registry {
 			r.byFile[fn] = l
 		}
 	}
+	for fam := range r.byFamily {
+		sort.Strings(r.byFamily[fam])
+	}
 	return r
+}
+
+// Family returns the language names that interoperate with name, including
+// name itself, sorted. Languages with no declared interop family — and names
+// not in the registry — return just [name]. Only an empty name returns nil.
+func (r *Registry) Family(name string) []string {
+	if name == "" {
+		return nil
+	}
+	l, ok := r.byName[name]
+	if !ok {
+		return []string{name}
+	}
+	if l.Family == "" {
+		return []string{name}
+	}
+	members := r.byFamily[l.Family]
+	out := make([]string, len(members))
+	copy(out, members)
+	return out
 }
 
 // ForFile returns the language for a file path, or nil if unrecognized.

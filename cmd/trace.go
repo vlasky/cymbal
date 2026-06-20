@@ -21,6 +21,18 @@ what those call, etc. Complementary to impact (which traces upward).
 By default trace only follows invocation edges (ref kind=call). Use
 --kinds to include broader relationships (e.g. type mentions).
 
+Callees that don't resolve to an indexed symbol (stdlib, third-party, or
+builtins) are filtered out by default. Pass --include-unresolved to keep
+them in the text/JSON output (and as dashed ext: nodes in --graph mode).
+
+A callee resolves only within its caller's language family by default
+(--resolve-scope family: JVM java/kotlin/scala, JS javascript/typescript/tsx,
+C c/cpp). Use --resolve-scope same for exact-language only, or all to resolve
+across every language. This affects which callees a name resolves to, not
+which symbol the trace starts from: if the symbol you ask about exists in more
+than one language, the trace still covers each. Add a file hint like
+pkg/file.go:Name to target a single symbol.
+
 Multi-symbol: pass more than one name (or pipe via --stdin) to get the
 union of callees across all requested symbols. Shared callees are deduped
 and a hit_symbols attribution list records which of the requested symbols
@@ -31,6 +43,7 @@ Examples:
   cymbal trace handleRegister --depth 5           # deeper trace
   cymbal trace Save Load Delete                   # union of callees
   cymbal trace handleRegister --kinds call,use    # include identifier mentions
+  cymbal trace handleRegister --include-unresolved # keep stdlib/external calls
   cymbal outline svc.go -s --names | cymbal trace --stdin`,
 	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -41,6 +54,11 @@ Examples:
 		limit, _ := cmd.Flags().GetInt("limit")
 		kindsRaw, _ := cmd.Flags().GetString("kinds")
 		kinds := parseKindsFlag(kindsRaw)
+		includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
+		scope, err := resolveScopeOrError(cmd)
+		if err != nil {
+			return err
+		}
 
 		// Strip file-hint prefixes ("pkg/file.go:Sym" -> "Sym"); trace resolves
 		// by name internally so the hint is informational.
@@ -59,7 +77,8 @@ Examples:
 			return renderAsGraph(cmd, entry.Path, names, index.GraphDirectionDown, 2)
 		}
 
-		merged, sourceMap, labelMap, totalRaw, err := mergeTracePlan(plan, names, depth, limit, kinds)
+		opts := index.TraceOptions{IncludeUnresolved: includeUnresolved, Scope: scope}
+		merged, sourceMap, labelMap, totalRaw, err := mergeTracePlan(plan, names, depth, limit, kinds, opts)
 		_ = labelMap
 		if err != nil {
 			return err
@@ -73,26 +92,32 @@ Examples:
 			return nil
 		}
 
+		ambig := ambiguousSymbolLanguages(plan, names)
+
 		if jsonOut {
-			if len(names) > 1 {
-				// Attach hit_symbols attribution.
-				out := make([]map[string]any, 0, len(merged))
-				for _, r := range merged {
-					out = append(out, map[string]any{
-						"row":         r,
-						"hit_symbols": sourceMap[traceKey(r)],
-					})
-				}
-				return writeJSON(map[string]any{
-					"symbols":   names,
-					"direction": "downward (callees)",
-					"depth":     depth,
-					"edges":     len(merged),
-					"raw_rows":  totalRaw,
-					"results":   out,
+			// One object shape for any symbol count. Each result carries
+			// hit_symbols attribution (which requested symbols reached the
+			// callee); for a single symbol that's just that symbol.
+			out := make([]map[string]any, 0, len(merged))
+			for _, r := range merged {
+				out = append(out, map[string]any{
+					"row":         r,
+					"hit_symbols": sourceMap[traceKey(r)],
 				})
 			}
-			return writeJSON(merged)
+			payload := map[string]any{
+				"symbols":       names,
+				"direction":     "downward (callees)",
+				"depth":         depth,
+				"edges":         len(merged),
+				"raw_rows":      totalRaw,
+				"resolve_scope": string(scope),
+				"results":       out,
+			}
+			if len(ambig) > 0 {
+				payload["symbol_languages"] = ambig
+			}
+			return writeJSON(payload)
 		}
 
 		var content strings.Builder
@@ -118,6 +143,10 @@ Examples:
 		meta = append(meta, kv{"direction", "downward (callees)"})
 		meta = append(meta, kv{"depth", fmt.Sprintf("%d", depth)})
 		meta = append(meta, kv{"edges", fmt.Sprintf("%d", len(merged))})
+		meta = append(meta, kv{"resolve_scope", string(scope)})
+		if s := formatSymbolLanguages(ambig); s != "" {
+			meta = append(meta, kv{"symbol_languages", s})
+		}
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}
@@ -138,13 +167,13 @@ func traceKey(r index.TraceResult) string {
 // mergeTrace runs FindTrace against a single DB. Retained for back-compat
 // with single-DB callers (tests).
 func mergeTrace(dbPath string, names []string, depth, limit int, kinds []string) ([]index.TraceResult, map[string][]string, int, error) {
-	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, func(string) string { return dbPath })
+	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, index.TraceOptions{}, func(string) string { return dbPath })
 	return merged, source, raw, err
 }
 
 // mergeTracePlan is the federation-aware variant: each name routes to
 // whichever DB owns the seed; callees stay within that DB (non-goal #1).
-func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []string) ([]index.TraceResult, map[string][]string, map[string]string, int, error) {
+func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []string, opts index.TraceOptions) ([]index.TraceResult, map[string][]string, map[string]string, int, error) {
 	resolve := func(name string) string {
 		entry, _ := findSymbolEntry(plan, name)
 		return entry.Path
@@ -154,18 +183,18 @@ func mergeTracePlan(plan DBPlan, names []string, depth, limit int, kinds []strin
 		entry, _ := findSymbolEntry(plan, name)
 		labelMap[name] = entry.Label()
 	}
-	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, resolve)
+	merged, source, _, raw, err := runMergeTrace(names, depth, limit, kinds, opts, resolve)
 	return merged, source, labelMap, raw, err
 }
 
-func runMergeTrace(names []string, depth, limit int, kinds []string, dbForName func(string) string) ([]index.TraceResult, map[string][]string, map[string]int, int, error) {
+func runMergeTrace(names []string, depth, limit int, kinds []string, opts index.TraceOptions, dbForName func(string) string) ([]index.TraceResult, map[string][]string, map[string]int, int, error) {
 	var merged []index.TraceResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{}
 	totalRaw := 0
 	for _, name := range names {
 		dbPath := dbForName(name)
-		rows, err := index.FindTrace(dbPath, name, depth, limit, kinds...)
+		rows, err := index.FindTraceWithOptions(dbPath, name, depth, limit, opts, kinds...)
 		if err != nil {
 			return nil, nil, nil, 0, err
 		}
@@ -204,6 +233,7 @@ func init() {
 		"comma-separated ref kinds to follow: call, use, implements (default call)")
 	addStdinFlag(traceCmd)
 	addGraphFlags(traceCmd)
+	addResolveScopeFlag(traceCmd)
 	rootCmd.AddCommand(traceCmd)
 }
 

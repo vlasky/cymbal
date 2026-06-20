@@ -31,6 +31,10 @@ Examples:
 		depth, _ := cmd.Flags().GetInt("depth")
 		limit, _ := cmd.Flags().GetInt("limit")
 		ctx, _ := cmd.Flags().GetInt("context")
+		scope, err := resolveScopeOrError(cmd)
+		if err != nil {
+			return err
+		}
 
 		names, err := collectSymbols(cmd, args)
 		if err != nil {
@@ -48,7 +52,7 @@ Examples:
 
 		// Per-symbol seed-only federation: each name routes to whichever
 		// DB owns it, callers stay within that DB.
-		merged, sourceMap, labelMap, totalRaw, err := mergeImpactPlan(plan, names, depth, limit)
+		merged, sourceMap, labelMap, totalRaw, err := mergeImpactPlan(plan, names, depth, limit, scope)
 		if err != nil {
 			return err
 		}
@@ -60,26 +64,31 @@ Examples:
 			return fmt.Errorf("no callers found for any of: %s", strings.Join(names, ", "))
 		}
 
+		ambig := ambiguousSymbolLanguages(plan, names)
+
 		if jsonOut {
 			enriched := enrichImpact(merged, ctx)
-			// Attach hit_symbols attribution by returning a wrapper shape when
-			// multi-symbol. Single-symbol JSON is unchanged.
-			if len(names) > 1 {
-				out := make([]map[string]any, 0, len(enriched))
-				for i, row := range enriched {
-					key := impactKey(merged[i])
-					// enrichImpact returns values we rewrap; preserve its shape.
-					m := map[string]any{"row": row, "hit_symbols": sourceMap[key]}
-					out = append(out, m)
-				}
-				return writeJSON(map[string]any{
-					"symbols":       names,
-					"total_callers": len(merged),
-					"raw_rows":      totalRaw,
-					"results":       out,
+			// One object shape for any symbol count. Each result carries
+			// hit_symbols attribution (which requested symbols brought the
+			// caller in); for a single symbol that's just that symbol.
+			out := make([]map[string]any, 0, len(enriched))
+			for i, row := range enriched {
+				out = append(out, map[string]any{
+					"row":         row,
+					"hit_symbols": sourceMap[impactKey(merged[i])],
 				})
 			}
-			return writeJSON(enriched)
+			payload := map[string]any{
+				"symbols":       names,
+				"total_callers": len(merged),
+				"raw_rows":      totalRaw,
+				"resolve_scope": string(scope),
+				"results":       out,
+			}
+			if len(ambig) > 0 {
+				payload["symbol_languages"] = ambig
+			}
+			return writeJSON(payload)
 		}
 
 		// Group by depth.
@@ -135,6 +144,10 @@ Examples:
 			meta = append(meta, kv{"groups", fmt.Sprintf("%d", totalGroups)})
 		}
 		meta = append(meta, kv{"total_callers", fmt.Sprintf("%d", len(merged))})
+		meta = append(meta, kv{"resolve_scope", string(scope)})
+		if s := formatSymbolLanguages(ambig); s != "" {
+			meta = append(meta, kv{"symbol_languages", s})
+		}
 		if len(names) > 1 && totalRaw > len(merged) {
 			meta = append(meta, kv{"deduped_from", fmt.Sprintf("%d", totalRaw)})
 		}
@@ -152,6 +165,7 @@ func init() {
 	impactCmd.Flags().IntP("context", "C", 1, "lines of context around each call site (0 for single-line)")
 	addStdinFlag(impactCmd)
 	addGraphFlags(impactCmd)
+	addResolveScopeFlag(impactCmd)
 	rootCmd.AddCommand(impactCmd)
 }
 
@@ -166,14 +180,14 @@ func impactKey(r index.ImpactResult) string {
 // mergeImpact runs FindImpact for each requested symbol against a single DB.
 // Retained for back-compat with existing single-DB callers (tests).
 func mergeImpact(dbPath string, names []string, depth, limit int) ([]index.ImpactResult, map[string][]string, int, error) {
-	merged, source, _, raw, err := runMergeImpact(names, depth, limit, func(string) string { return dbPath })
+	merged, source, _, raw, err := runMergeImpact(names, depth, limit, index.ResolveScopeFamily, func(string) string { return dbPath })
 	return merged, source, raw, err
 }
 
 // mergeImpactPlan is the federation-aware variant. Each requested name routes
 // to whichever DB in plan.Federated owns the seed; downstream callers stay
 // within that DB (non-goal #1). labelMap maps each name to its worktree label.
-func mergeImpactPlan(plan DBPlan, names []string, depth, limit int) ([]index.ImpactResult, map[string][]string, map[string]string, int, error) {
+func mergeImpactPlan(plan DBPlan, names []string, depth, limit int, scope index.ResolveScope) ([]index.ImpactResult, map[string][]string, map[string]string, int, error) {
 	resolve := func(name string) string {
 		entry, _ := findSymbolEntry(plan, name)
 		return entry.Path
@@ -183,20 +197,20 @@ func mergeImpactPlan(plan DBPlan, names []string, depth, limit int) ([]index.Imp
 		entry, _ := findSymbolEntry(plan, name)
 		labelMap[name] = entry.Label()
 	}
-	merged, source, _, raw, err := runMergeImpact(names, depth, limit, resolve)
+	merged, source, _, raw, err := runMergeImpact(names, depth, limit, scope, resolve)
 	return merged, source, labelMap, raw, err
 }
 
 // runMergeImpact factors the shared dedup logic so the single-DB and
 // federated paths don't drift apart over time.
-func runMergeImpact(names []string, depth, limit int, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, error) {
+func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, error) {
 	var merged []index.ImpactResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{} // key -> index in merged
 	totalRaw := 0
 	for _, name := range names {
 		dbPath := dbForName(name)
-		rows, err := index.FindImpact(dbPath, name, depth, limit)
+		rows, err := index.FindImpactWithScope(dbPath, name, scope, depth, limit)
 		if err != nil {
 			return nil, nil, nil, 0, err
 		}

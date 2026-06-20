@@ -27,6 +27,42 @@ func addGraphFlags(cmd *cobra.Command) {
 	cmd.Flags().Int("graph-limit", 0, "cap graph at top-N nodes by degree (0 = no cap)")
 }
 
+// addResolveScopeFlag wires the shared --resolve-scope flag onto verbs that do
+// name-based cross-language resolution (trace, impact, investigate).
+func addResolveScopeFlag(cmd *cobra.Command) {
+	cmd.Flags().String("resolve-scope", string(index.ResolveScopeFamily),
+		"cross-language name resolution: same (exact language) | family (interop group, default) | all (any language)")
+}
+
+// resolveScopeFlag reads --resolve-scope, normalizing empty/unknown values to
+// the family default. Safe to call on verbs that didn't register the flag
+// (returns the family default). Used on the graph render path after the verb's
+// RunE has already validated user input via resolveScopeOrError.
+func resolveScopeFlag(cmd *cobra.Command) index.ResolveScope {
+	if cmd.Flags().Lookup("resolve-scope") == nil {
+		return index.ResolveScopeFamily
+	}
+	raw, _ := cmd.Flags().GetString("resolve-scope")
+	return index.NormalizeScope(index.ResolveScope(strings.TrimSpace(raw)))
+}
+
+// resolveScopeOrError reads --resolve-scope and rejects unknown values, so an
+// agent passing a typo gets a clear error rather than a silent family default.
+// Verbs that didn't register the flag get the family default.
+func resolveScopeOrError(cmd *cobra.Command) (index.ResolveScope, error) {
+	if cmd.Flags().Lookup("resolve-scope") == nil {
+		return index.ResolveScopeFamily, nil
+	}
+	raw, _ := cmd.Flags().GetString("resolve-scope")
+	scope := index.ResolveScope(strings.TrimSpace(raw))
+	switch scope {
+	case index.ResolveScopeSame, index.ResolveScopeFamily, index.ResolveScopeAll:
+		return scope, nil
+	default:
+		return "", fmt.Errorf("invalid --resolve-scope %q: want one of same, family, all", raw)
+	}
+}
+
 // graphRequested reports whether the user asked for graph output on a verb
 // that supports --graph. Returns true if --graph was passed or --graph-format
 // was set to a non-empty value.
@@ -127,6 +163,12 @@ func renderPreparedGraph(cmd *cobra.Command, graph *index.GraphResult, rootIDs m
 	format := selectGraphFormatFromVerb(cmd)
 	userLimit, _ := cmd.Flags().GetInt("graph-limit")
 	graph = applyGraphLimit(graph, userLimit, format, rootIDs)
+	// Surface the active resolution scope on verbs that support it (trace,
+	// impact); set after merge/limit so it isn't dropped. Verbs without the
+	// flag (importers, impls) leave it empty.
+	if cmd.Flags().Lookup("resolve-scope") != nil {
+		graph.ResolveScope = resolveScopeFlag(cmd)
+	}
 	return renderGraph(format, graph)
 }
 
@@ -145,6 +187,7 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 	}
 	depth := graphDepthOrDefault(cmd, graphDefaultDepth)
 	includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
+	scope := resolveScopeFlag(cmd)
 
 	graphs := make([]*index.GraphResult, 0, len(symbols))
 	rootIDs := make(map[string]bool, len(symbols))
@@ -154,6 +197,7 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 			Direction:         direction,
 			Depth:             depth,
 			IncludeUnresolved: includeUnresolved,
+			ResolveScope:      scope,
 		}
 		g, err := index.BuildGraph(dbPath, q)
 		if err != nil {
@@ -424,6 +468,17 @@ func renderGraph(format index.GraphFormat, graph *index.GraphResult) error {
 	}
 }
 
+// graphNodeLabel is the display label for a node: the symbol name, plus a
+// "(N defs)" cue when the name is ambiguous (collapses multiple definitions),
+// so the conflation is visible in mermaid/dot. Paths stay out of the visual
+// label — they're in the JSON definitions list.
+func graphNodeLabel(node index.GraphNode) string {
+	if node.DefinitionCount > 1 {
+		return fmt.Sprintf("%s (%d defs)", node.Label, node.DefinitionCount)
+	}
+	return node.Label
+}
+
 func renderGraphMermaid(graph *index.GraphResult) string {
 	if len(graph.Nodes) == 0 && len(graph.Edges) == 0 {
 		return "flowchart LR\n%% no edges\n"
@@ -431,7 +486,7 @@ func renderGraphMermaid(graph *index.GraphResult) string {
 	var b strings.Builder
 	b.WriteString("flowchart LR\n")
 	for _, node := range graph.Nodes {
-		fmt.Fprintf(&b, "  %s[%q]\n", node.ID, node.Label)
+		fmt.Fprintf(&b, "  %s[%q]\n", node.ID, graphNodeLabel(node))
 	}
 	for _, edge := range graph.Edges {
 		arrow := "-->"
@@ -450,7 +505,7 @@ func renderGraphDOT(graph *index.GraphResult) string {
 	var b strings.Builder
 	b.WriteString("digraph cymbal {\n")
 	for _, node := range graph.Nodes {
-		fmt.Fprintf(&b, "  %s [label=%q];\n", node.ID, node.Label)
+		fmt.Fprintf(&b, "  %s [label=%q];\n", node.ID, graphNodeLabel(node))
 	}
 	for _, edge := range graph.Edges {
 		attrs := ""
