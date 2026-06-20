@@ -1542,11 +1542,32 @@ func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) 
 
 // FindTraceWithOptions is FindTrace with explicit control over filtering behavior.
 func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
+	results, _, err := s.findTraceWithOptions(symbolName, depth, limit, opts, kinds...)
+	return results, err
+}
+
+// findTraceWithOptions is the trace BFS core; the bool reports whether the
+// per-query limit truncated the result set. Truncation is detected by
+// over-fetching one row past the limit, then trimming — but only on the normal
+// path. The graph builder exempts unresolved rows from the limit
+// (UnresolvedExemptFromLimit), where len(results) legitimately exceeds limit, so
+// it is neither over-fetched nor trimmed.
+func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, bool, error) {
 	if depth <= 0 {
 		depth = 3
 	}
 	if depth > 5 {
 		depth = 5
+	}
+	// Over-fetch one past the limit to detect truncation — but only on the
+	// normal path with a positive limit. The graph builder exempts unresolved
+	// rows (UnresolvedExemptFromLimit) and must not be trimmed; a non-positive
+	// limit keeps its prior store-level meaning (no normalization here, so
+	// direct callers are unaffected — the package wrapper does its own clamp).
+	overfetch := !opts.UnresolvedExemptFromLimit && limit > 0
+	budget := limit
+	if overfetch {
+		budget = limit + 1
 	}
 	if len(kinds) == 0 {
 		kinds = []string{symbols.RefKindCall}
@@ -1638,7 +1659,7 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 	// to their caller's resolution scope below.
 	currentLocs := resolveSymbol(symbolName, nil)
 
-	for d := 1; d <= depth && len(currentLocs) > 0 && limited < limit; d++ {
+	for d := 1; d <= depth && len(currentLocs) > 0 && limited < budget; d++ {
 		var nextLocs []symLoc
 		for _, loc := range currentLocs {
 			callees := calleesOf(loc)
@@ -1678,8 +1699,13 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 				// they can't starve resolved traversal within the limit.
 				if resolved || !opts.UnresolvedExemptFromLimit {
 					limited++
-					if limited >= limit {
-						return results, nil
+					if limited >= budget {
+						if overfetch {
+							// We collected one past the limit, so a further
+							// callee genuinely exists: report truncation.
+							return results[:limit], true, nil
+						}
+						return results, false, nil
 					}
 				}
 			}
@@ -1687,7 +1713,7 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 		currentLocs = nextLocs
 	}
 
-	return results, nil
+	return results, false, nil
 }
 
 // SymbolLanguages returns the distinct languages of indexed symbols with the
@@ -1708,6 +1734,31 @@ func (s *Store) SymbolLanguages(name string) ([]string, error) {
 		langs = append(langs, l)
 	}
 	return langs, rows.Err()
+}
+
+// Impact traversal bounds. These are the single source of truth for clamping
+// depth/limit; both the BFS core and the CLI (for reporting effective values)
+// derive from ClampImpactBounds so the two never drift.
+const (
+	defaultImpactDepth = 2
+	maxImpactDepth     = 5
+	defaultImpactLimit = 100
+)
+
+// ClampImpactBounds normalizes a requested (depth, limit) to the values the
+// impact BFS actually uses: depth into [1, maxImpactDepth] defaulting to
+// defaultImpactDepth, and a non-positive limit to defaultImpactLimit.
+func ClampImpactBounds(depth, limit int) (int, int) {
+	if depth <= 0 {
+		depth = defaultImpactDepth
+	}
+	if depth > maxImpactDepth {
+		depth = maxImpactDepth
+	}
+	if limit <= 0 {
+		limit = defaultImpactLimit
+	}
+	return depth, limit
 }
 
 // FindImpact performs transitive caller analysis using BFS, unrestricted by
@@ -1732,12 +1783,25 @@ func (s *Store) FindImpactScoped(symbolName, language string, depth, limit int) 
 // transitive caller chains while still admitting interop within a family.
 // A nil/empty langs set applies no restriction.
 func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limit int) ([]ImpactResult, error) {
-	if depth <= 0 {
-		depth = 2
-	}
-	if depth > 5 {
-		depth = 5
-	}
+	results, _, err := s.findImpactInLangs(symbolName, langs, depth, limit, false)
+	return results, err
+}
+
+// findImpactInLangs is the BFS core. It additionally reports whether the
+// per-query limit truncated the result set, and can drop test-file callers
+// during traversal (noTests).
+//
+// Truncation is detected honestly: the walk over-fetches one row past limit, so
+// returning exactly limit callers reflects a real boundary (a (limit+1)th caller
+// existed) rather than a coincidental stop.
+//
+// noTests uses "hide but still traverse" semantics — a test caller is omitted
+// from results (and never consumes the limit budget) but its own callers are
+// still explored, so production code reachable through a test isn't lost. In the
+// caller direction tests are almost always terminal, so this rarely differs from
+// pruning; it is the safer default.
+func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
+	depth, limit = ClampImpactBounds(depth, limit)
 
 	langFilter := ""
 	if len(langs) > 0 {
@@ -1746,11 +1810,15 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 		langFilter = " AND r.language IN (" + placeholders + ")"
 	}
 
+	// Over-fetch one past the limit so we can distinguish "exactly limit
+	// callers, no more" from "limit callers and the walk was cut short".
+	fetchTarget := limit + 1
+
 	seen := make(map[string]bool)
 	var results []ImpactResult
 	currentSymbols := []string{symbolName}
 
-	for d := 1; d <= depth && len(currentSymbols) > 0 && len(results) < limit; d++ {
+	for d := 1; d <= depth && len(currentSymbols) > 0 && len(results) < fetchTarget; d++ {
 		var nextSymbols []string
 		for _, sym := range currentSymbols {
 			args := []interface{}{sym}
@@ -1782,6 +1850,14 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 				}
 				seen[key] = true
 
+				// Traverse through the caller regardless, so production code
+				// behind a (hidden) test caller is still discovered.
+				nextSymbols = append(nextSymbols, caller)
+
+				if noTests && ClassifyPath(relPath) == PathClassTest {
+					continue
+				}
+
 				results = append(results, ImpactResult{
 					Symbol:  sym,
 					Caller:  caller,
@@ -1790,11 +1866,10 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 					Line:    line,
 					Depth:   d,
 				})
-				nextSymbols = append(nextSymbols, caller)
 
-				if len(results) >= limit {
+				if len(results) >= fetchTarget {
 					rows.Close()
-					return results, nil
+					return results[:limit], true, nil
 				}
 			}
 			rows.Close()
@@ -1802,5 +1877,5 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 		currentSymbols = nextSymbols
 	}
 
-	return results, nil
+	return results, false, nil
 }

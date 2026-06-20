@@ -275,6 +275,171 @@ cymbal refs handleAuth --impact
 
 ---
 
+## `cymbal investigate`
+
+Kind-adaptive investigation — returns the right shape of context for whatever a
+symbol is, so you don't have to choose between `search`, `show`, `refs`, and
+`impact`.
+
+```sh
+cymbal investigate <symbol> [symbol2 ...] [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--stdin` | Read additional symbol names (newline-separated) from stdin |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+
+What you get back depends on the symbol's kind:
+
+- function / method → source + callers + shallow impact
+- class / struct / type / interface → source + members + references
+- ambiguous name → auto-resolves to the best match and notes the alternatives
+
+Disambiguate with a file or parent hint (`config.go:Config`, `auth.Middleware`),
+and pass several names (or pipe newline-separated names via `--stdin`) to
+investigate a batch.
+
+```sh
+cymbal investigate OpenStore
+cymbal investigate config.go:Config     # file hint
+cymbal investigate Foo Bar Baz          # batch
+cymbal outline svc.go -s --names | cymbal investigate --stdin
+```
+
+---
+
+## `cymbal trace`
+
+Downward call trace — what does this symbol call? Complementary to `impact`,
+which traces callers upward.
+
+```sh
+cymbal trace <symbol> [symbol2 ...] [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--depth <n>` | Max traversal depth (default: 3) |
+| `-n, --limit <n>` | Max results per symbol (default: 50) |
+| `--kinds <list>` | Comma-separated ref kinds to follow: `call`, `use`, `implements` (default: `call`) |
+| `--stdin` | Read additional symbol names (newline-separated) from stdin |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+| `--include-unresolved` | Keep callees that don't resolve to an indexed symbol (stdlib, third-party, builtins); dashed `ext:` nodes under `--graph` |
+| `--graph` | Render the call tree as a visual graph |
+| `--graph-format <fmt>` | `mermaid`, `dot`, or `json` (implies `--graph`) |
+| `--graph-limit <n>` | Cap the graph size by degree (0 for no cap) |
+
+By default `trace` follows only invocation edges (`call`) and drops callees that
+don't resolve to an indexed symbol. `--include-unresolved` keeps those external
+callees in the text/JSON output (and renders them as dashed `ext:` nodes under
+`--graph`). Like `impact`, `trace` reports `truncated` when a per-symbol
+`--limit` is hit. Pass several names (or pipe via `--stdin`) for the union of
+callees, deduplicated with a `hit_symbols` attribution list.
+
+```sh
+cymbal trace handleRegister                      # call chain (depth 3)
+cymbal trace handleRegister --depth 5            # deeper trace
+cymbal trace Save Load Delete                    # union of callees
+cymbal trace handleRegister --include-unresolved # keep stdlib/external calls
+cymbal outline svc.go -s --names | cymbal trace --stdin
+```
+
+---
+
+## `cymbal impact`
+
+Transitive caller analysis — what is impacted if a symbol changes.
+
+```sh
+cymbal impact <symbol> [symbol2 ...] [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-D, --depth <n>` | Max call-chain depth (max 5, default: 2) |
+| `-n, --limit <n>` | Max callers per symbol (default: 50) |
+| `--no-tests` | Exclude callers in test files (keeps production + unknown) |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+
+Callers are classified by file path as **production**, **test**, or **unknown**,
+so the header reports the real blast radius rather than a bare count:
+
+```sh
+$ cymbal impact Index --depth 1
+total_callers: 29 (5 production, 24 test)
+references: 39 (8 production, 31 test) in 12 (4 production, 8 test)
+```
+
+- `truncated: true` is shown (and emitted in `--json`) when a per-symbol
+  `--limit` was hit, so a partial caller set is never presented as complete.
+- The `references` line / JSON `metrics` block are exact, un-truncated counts of
+  references to the symbol (reference sites and distinct files, split by class) —
+  true breadth even when callers are capped. They are name-scoped: an ambiguous
+  name (several definitions) is flagged via `definition_count` / `definitions`.
+- `--no-tests` drops test-file callers; classification happens during traversal,
+  so test callers never consume the `--limit` budget ahead of production ones.
+
+```sh
+# only the production callers worth inspecting
+cymbal impact Index --no-tests
+```
+
+`trace` likewise reports `truncated` when its `--limit` is hit.
+
+---
+
+## `cymbal changed`
+
+Diff-scoped impact — map a git diff to the symbols it touches and report each
+one's references and transitive impact in a single call.
+
+```sh
+cymbal changed [flags]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--staged` | Diff the staged changes (index vs HEAD) instead of the working tree |
+| `--base <ref>` | Diff the working tree against another single ref (e.g. `main`) |
+| `-D, --depth <n>` | Max call-chain depth for impact (max 5, default: 2) |
+| `-n, --limit <n>` | Max callers per changed symbol (default: 50) |
+| `--max-symbols <n>` | Max changed symbols to analyze (default: 40, 0 = unlimited) |
+| `--max-impact <n>` | Soft cap on total caller rows across symbols (default: 500) |
+| `--no-tests` | Exclude callers in test files from impact |
+| `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
+
+Defaults to **unstaged** working-tree changes (`git diff`). Changed symbols are
+attributed by parsing the actual diffed blobs on both sides: added/modified lines
+map to symbols in the new version, deleted lines to symbols in the old version.
+So whole-symbol deletions are **named** (listed under `deleted`), `--staged`
+attribution matches the staged content even with unstaged edits present, and
+each changed line maps to its enclosing navigable definition.
+
+```sh
+# what does my uncommitted edit affect?
+$ cymbal changed
+changed_symbols: 1
+base: working tree
+---
+# ClassifyPath  (index/classify.go)
+  references: 6 (4 production, 2 test) in 6 (4 production, 2 test)
+  impact: 14 (12 production, 2 test) callers
+```
+
+```sh
+cymbal changed --staged        # staged changes (index vs HEAD)
+cymbal changed --base main     # working tree vs your branch point
+cymbal changed --json          # full structured payload for agents
+```
+
+Operates only on the current worktree. Counts are name-scoped (cymbal resolves
+references by name); arbitrary commit ranges (`a..b`) and deleted-symbol impact
+are out of scope. Deleted/binary/unsupported files are reported, not silently
+dropped.
+
+---
+
 ## `cymbal hook`
 
 Agent-integration helpers for session reminders, shell nudges, and supported

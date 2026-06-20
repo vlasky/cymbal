@@ -1150,9 +1150,6 @@ func SymbolLanguages(dbPath, name string) ([]string, error) {
 // FindImpact performs transitive caller analysis for a symbol, unrestricted by
 // language.
 func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, error) {
-	if limit <= 0 {
-		limit = 100
-	}
 	store, err := openCached(dbPath)
 	if err != nil {
 		return nil, err
@@ -1166,13 +1163,13 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 // A seed spanning multiple languages uses the union of their families. With
 // ResolveScopeAll, or when the seed has no indexed language to scope from, it
 // is unrestricted.
-func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int) ([]ImpactResult, error) {
-	if limit <= 0 {
-		limit = 100
-	}
+//
+// noTests drops test-file callers during traversal. The returned bool reports
+// whether the per-symbol limit truncated the result set.
+func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
 	store, err := openCached(dbPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var langs []string
 	if NormalizeScope(scope) != ResolveScopeAll {
@@ -1180,7 +1177,7 @@ func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, l
 			langs = scopeLanguagesUnion(seedLangs, scope)
 		}
 	}
-	return store.FindImpactInLangs(symbolName, langs, depth, limit)
+	return store.findImpactInLangs(symbolName, langs, depth, limit, noTests)
 }
 
 // FindTrace performs downward call graph traversal for a symbol.
@@ -1191,14 +1188,21 @@ func FindTrace(dbPath, symbolName string, depth, limit int, kinds ...string) ([]
 
 // FindTraceWithOptions is FindTrace with explicit control over filtering.
 func FindTraceWithOptions(dbPath, symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
+	rows, _, err := FindTraceWithTruncation(dbPath, symbolName, depth, limit, opts, kinds...)
+	return rows, err
+}
+
+// FindTraceWithTruncation is FindTraceWithOptions that also reports whether the
+// per-query limit truncated the result set (detected by over-fetching one row).
+func FindTraceWithTruncation(dbPath, symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, bool, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	store, err := openCached(dbPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return store.FindTraceWithOptions(symbolName, depth, limit, opts, kinds...)
+	return store.findTraceWithOptions(symbolName, depth, limit, opts, kinds...)
 }
 
 // BuildGraph renders symbol relationships as a graph from an opened DB.

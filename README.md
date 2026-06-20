@@ -181,7 +181,8 @@ For both humans and agents, three commands cover most investigations:
 |---|---|---|
 | `investigate X` | "Tell me about X" | Adaptive: source + callers + impact or members |
 | `trace X` | "What does X depend on?" | Downward: callees |
-| `impact X` | "What depends on X?" | Upward: callers |
+| `impact X` | "What depends on X?" | Upward: callers (split production/test) |
+| `changed` | "What does my current diff affect?" | Diff -> changed symbols + impact |
 
 This matters because a normal code-reading loop often turns into
 search -> show -> refs -> show-next-function -> repeat. Cymbal collapses that
@@ -194,7 +195,8 @@ into fewer, more relevant tool calls with structured output.
 | `investigate` | **Start here.** Kind-adaptive exploration in one call |
 | `structure` | Structural overview: entry points, hotspots, central packages |
 | `trace` | Downward call graph. Add `--graph` for a visual dependency map |
-| `impact` | Upward caller graph. Add `--graph` for a visual blast-radius map |
+| `impact` | Upward caller graph (callers split production/test; `--no-tests` to focus). Add `--graph` for a visual blast-radius map |
+| `changed` | Diff-scoped impact: maps your git diff (working tree / `--staged` / `--base`) to changed symbols + their impact in one call |
 | `importers` | Reverse import lookup. Add `--graph` for a visual fan-in map |
 | `impls` | Find implementers / conformers / extensions. Add `--graph` for a conformance map |
 | `search` | Symbol search, or `--text` for grep-style lookup |

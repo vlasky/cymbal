@@ -10,7 +10,7 @@ import (
 )
 
 var investigateCmd = &cobra.Command{
-	Use:   "investigate <symbol>",
+	Use:   "investigate <symbol> [symbol2 ...]",
 	Short: "Kind-adaptive investigation — returns the right context for what a symbol is",
 	Long: `Investigate a symbol and get back the right shape of information
 based on what it is. No need to choose between search, show, refs,
@@ -29,8 +29,9 @@ Examples:
   cymbal investigate OpenStore
   cymbal investigate SymbolResult
   cymbal investigate config.Load
-  cymbal investigate Foo Bar Baz     # batch: investigate multiple symbols`,
-	Args: cobra.MinimumNArgs(1),
+  cymbal investigate Foo Bar Baz     # batch: investigate multiple symbols
+  cymbal outline svc.go -s --names | cymbal investigate --stdin`,
+	Args: cobra.MinimumNArgs(0),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		plan := resolveDBs(cmd)
 		ensureFresh(plan.Primary)
@@ -40,9 +41,14 @@ Examples:
 			return err
 		}
 
-		if jsonOut && len(args) > 1 {
+		names, err := collectSymbols(cmd, args)
+		if err != nil {
+			return err
+		}
+
+		if jsonOut && len(names) > 1 {
 			var all []any
-			for _, name := range args {
+			for _, name := range names {
 				entry, _ := findSymbolEntry(plan, name)
 				data := investigateOne(entry.Path, name, scope)
 				if label := entry.Label(); label != "" {
@@ -53,7 +59,7 @@ Examples:
 			return writeJSON(all)
 		}
 
-		for i, name := range args {
+		for i, name := range names {
 			if i > 0 {
 				fmt.Println()
 			}
@@ -221,6 +227,7 @@ func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string
 }
 
 func init() {
+	addStdinFlag(investigateCmd)
 	addResolveScopeFlag(investigateCmd)
 	rootCmd.AddCommand(investigateCmd)
 }
