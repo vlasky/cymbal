@@ -360,6 +360,7 @@ cymbal impact <symbol> [symbol2 ...] [flags]
 | `-D, --depth <n>` | Max call-chain depth (max 5, default: 2) |
 | `-n, --limit <n>` | Max callers per symbol (default: 50) |
 | `--no-tests` | Exclude callers in test files (keeps production + unknown) |
+| `--test-path <pat>` | Classify matching paths as test code, in addition to the built-in conventions (substring, or glob with `**`; repeatable) |
 | `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
 
 Callers are classified by file path as **production**, **test**, or **unknown**,
@@ -382,10 +383,17 @@ references: 39 (8 production, 31 test) in 12 (4 production, 8 test)
   In `--graph` mode, hidden test nodes are contracted: a production caller
   reachable only through a test helper stays connected to the seed via a dashed
   edge marked `"indirect": true` in the JSON.
+- `--test-path` extends the built-in test classification with repo-specific
+  patterns (e.g. `--test-path qa/ --test-path '**/*_it.go'`) for layouts the
+  conventions don't cover. It affects the caller split, `--no-tests`, and the
+  `metrics` block on both `impact` and `changed`.
 
 ```sh
 # only the production callers worth inspecting
 cymbal impact Index --no-tests
+
+# treat the qa/ tree as test code too
+cymbal impact Index --no-tests --test-path qa/
 ```
 
 `trace` likewise reports `truncated` when its `--limit` is hit.
@@ -410,6 +418,7 @@ cymbal changed [flags]
 | `--max-symbols <n>` | Max changed symbols to analyze (default: 40, 0 = unlimited) |
 | `--max-impact <n>` | Soft cap on total caller rows across symbols (default: 500) |
 | `--no-tests` | Exclude callers in test files from impact |
+| `--test-path <pat>` | Classify matching paths as test code, in addition to the built-in conventions (substring, or glob with `**`; repeatable) |
 | `--resolve-scope <s>` | `same` \| `family` \| `all` (default: family) |
 
 Defaults to **unstaged** working-tree changes (`git diff`). Changed symbols are

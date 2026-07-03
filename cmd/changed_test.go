@@ -321,7 +321,7 @@ func TestAggregateReferencesSumsAcrossSeeds(t *testing.T) {
 	_, dbPath := newPhase2Repo(t)
 	db := func(string) string { return dbPath }
 
-	one, refErr := aggregateReferences([]string{"helper"}, index.ResolveScopeFamily, db)
+	one, refErr := aggregateReferences([]string{"helper"}, index.ResolveScopeFamily, nil, db)
 	if refErr {
 		t.Fatalf("unexpected reference error")
 	}
@@ -329,7 +329,7 @@ func TestAggregateReferencesSumsAcrossSeeds(t *testing.T) {
 		t.Fatalf("expected helper to have references, got %+v", one)
 	}
 
-	both, _ := aggregateReferences([]string{"helper", "Shared"}, index.ResolveScopeFamily, db)
+	both, _ := aggregateReferences([]string{"helper", "Shared"}, index.ResolveScopeFamily, nil, db)
 	if both.Rows <= one.Rows {
 		t.Errorf("aggregate rows for {helper,Shared} (%d) should exceed helper alone (%d)", both.Rows, one.Rows)
 	}

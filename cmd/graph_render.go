@@ -191,10 +191,15 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 	depth := graphDepthOrDefault(cmd, graphDefaultDepth)
 	includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
 	scope := resolveScopeFlag(cmd)
-	// Only impact defines --no-tests; on other verbs the lookup returns false.
+	// Only impact defines --no-tests/--test-path; on other verbs the lookups
+	// miss and the zero values apply.
 	noTests := false
 	if cmd.Flags().Lookup("no-tests") != nil {
 		noTests, _ = cmd.Flags().GetBool("no-tests")
+	}
+	var testPaths []string
+	if cmd.Flags().Lookup("test-path") != nil {
+		testPaths, _ = cmd.Flags().GetStringArray("test-path")
 	}
 
 	graphs := make([]*index.GraphResult, 0, len(symbols))
@@ -207,6 +212,7 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 			IncludeUnresolved: includeUnresolved,
 			ResolveScope:      scope,
 			NoTests:           noTests,
+			TestPaths:         testPaths,
 		}
 		g, err := index.BuildGraph(dbPath, q)
 		if err != nil {

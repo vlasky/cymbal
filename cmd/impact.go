@@ -32,6 +32,8 @@ Examples:
 		limit, _ := cmd.Flags().GetInt("limit")
 		ctx, _ := cmd.Flags().GetInt("context")
 		noTests, _ := cmd.Flags().GetBool("no-tests")
+		testPaths, _ := cmd.Flags().GetStringArray("test-path")
+		classifier := index.NewClassifier(testPaths)
 		scope, err := resolveScopeOrError(cmd)
 		if err != nil {
 			return err
@@ -53,7 +55,8 @@ Examples:
 
 		// Per-symbol seed-only federation: each name routes to whichever
 		// DB owns it, callers stay within that DB.
-		merged, sourceMap, labelMap, totalRaw, truncated, err := mergeImpactPlan(plan, names, depth, limit, scope, noTests)
+		opts := index.ImpactOptions{Scope: scope, Depth: depth, Limit: limit, NoTests: noTests, TestPaths: testPaths}
+		merged, sourceMap, labelMap, totalRaw, truncated, err := mergeImpactPlan(plan, names, opts)
 		if err != nil {
 			return err
 		}
@@ -65,12 +68,12 @@ Examples:
 		}
 
 		ambig := ambiguousSymbolLanguages(plan, names)
-		prodN, testN, unknownN := classifyImpact(merged)
+		prodN, testN, unknownN := classifyImpact(classifier, merged)
 		dbForName := func(name string) string {
 			entry, _ := findSymbolEntry(plan, name)
 			return entry.Path
 		}
-		refs, refErr := aggregateReferences(names, scope, dbForName)
+		refs, refErr := aggregateReferences(names, scope, classifier, dbForName)
 		defsByName, defCount, ambiguous, defErr := collectDefinitions(names, dbForName)
 		effDepth, effLimit := index.ClampImpactBounds(depth, limit)
 
@@ -208,6 +211,8 @@ func init() {
 	impactCmd.Flags().IntP("limit", "n", 50, "max results per symbol")
 	impactCmd.Flags().IntP("context", "C", 1, "lines of context around each call site (0 for single-line)")
 	impactCmd.Flags().Bool("no-tests", false, "exclude callers in test files (keeps production + unknown)")
+	impactCmd.Flags().StringArray("test-path", nil,
+		"classify paths matching this pattern as test code, in addition to the built-in conventions (substring, or glob with **; repeatable)")
 	addStdinFlag(impactCmd)
 	addGraphFlags(impactCmd)
 	addResolveScopeFlag(impactCmd)
@@ -225,7 +230,8 @@ func impactKey(r index.ImpactResult) string {
 // mergeImpact runs FindImpact for each requested symbol against a single DB.
 // Retained for back-compat with existing single-DB callers (tests).
 func mergeImpact(dbPath string, names []string, depth, limit int) ([]index.ImpactResult, map[string][]string, int, error) {
-	merged, source, _, raw, _, err := runMergeImpact(names, depth, limit, index.ResolveScopeFamily, false, func(string) string { return dbPath })
+	opts := index.ImpactOptions{Scope: index.ResolveScopeFamily, Depth: depth, Limit: limit}
+	merged, source, _, raw, _, err := runMergeImpact(names, opts, func(string) string { return dbPath })
 	return merged, source, raw, err
 }
 
@@ -233,7 +239,7 @@ func mergeImpact(dbPath string, names []string, depth, limit int) ([]index.Impac
 // to whichever DB in plan.Federated owns the seed; downstream callers stay
 // within that DB (non-goal #1). labelMap maps each name to its worktree label.
 // The returned bool is true if any seed's per-symbol limit truncated its callers.
-func mergeImpactPlan(plan DBPlan, names []string, depth, limit int, scope index.ResolveScope, noTests bool) ([]index.ImpactResult, map[string][]string, map[string]string, int, bool, error) {
+func mergeImpactPlan(plan DBPlan, names []string, opts index.ImpactOptions) ([]index.ImpactResult, map[string][]string, map[string]string, int, bool, error) {
 	resolve := func(name string) string {
 		entry, _ := findSymbolEntry(plan, name)
 		return entry.Path
@@ -243,14 +249,14 @@ func mergeImpactPlan(plan DBPlan, names []string, depth, limit int, scope index.
 		entry, _ := findSymbolEntry(plan, name)
 		labelMap[name] = entry.Label()
 	}
-	merged, source, _, raw, truncated, err := runMergeImpact(names, depth, limit, scope, noTests, resolve)
+	merged, source, _, raw, truncated, err := runMergeImpact(names, opts, resolve)
 	return merged, source, labelMap, raw, truncated, err
 }
 
 // runMergeImpact factors the shared dedup logic so the single-DB and
 // federated paths don't drift apart over time. The returned bool is true if any
 // seed symbol hit its per-symbol limit (the merged set may be incomplete).
-func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, noTests bool, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, bool, error) {
+func runMergeImpact(names []string, opts index.ImpactOptions, dbForName func(string) string) ([]index.ImpactResult, map[string][]string, map[string]int, int, bool, error) {
 	var merged []index.ImpactResult
 	sourceMap := map[string][]string{}
 	seen := map[string]int{} // key -> index in merged
@@ -258,7 +264,7 @@ func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, 
 	truncated := false
 	for _, name := range names {
 		dbPath := dbForName(name)
-		rows, tr, err := index.FindImpactWithScope(dbPath, name, scope, depth, limit, noTests)
+		rows, tr, err := index.FindImpactWithOptions(dbPath, name, opts)
 		if err != nil {
 			return nil, nil, nil, 0, false, err
 		}
@@ -300,7 +306,7 @@ func runMergeImpact(names []string, depth, limit int, scope index.ResolveScope, 
 // symbols and returns the total definition count (a name with several
 // definitions makes the name-scoped counts span them — surfaced as an ambiguity
 // signal). dbForName routes each name to whichever federated DB owns it.
-func aggregateReferences(names []string, scope index.ResolveScope, dbForName func(string) string) (counts index.ReferenceCounts, refErr bool) {
+func aggregateReferences(names []string, scope index.ResolveScope, cl *index.Classifier, dbForName func(string) string) (counts index.ReferenceCounts, refErr bool) {
 	// Merge per-file row counts across seeds before folding, so a file that
 	// references more than one requested symbol is counted once in the distinct
 	// referencing-file totals (summing per-symbol counts would double-count it).
@@ -314,7 +320,7 @@ func aggregateReferences(names []string, scope index.ResolveScope, dbForName fun
 			refErr = true
 		}
 	}
-	return index.FoldReferenceCounts(merged), refErr
+	return index.FoldReferenceCountsWith(cl, merged), refErr
 }
 
 // defLoc is one indexed definition of a name (for ambiguity reporting).
@@ -364,9 +370,9 @@ func collectDefinitions(names []string, dbForName func(string) string) (byName m
 
 // classifyImpact splits a caller set into production / test / unknown counts by
 // each caller's file path. Used for the header/JSON triage split.
-func classifyImpact(rows []index.ImpactResult) (prod, test, unknown int) {
+func classifyImpact(cl *index.Classifier, rows []index.ImpactResult) (prod, test, unknown int) {
 	for _, r := range rows {
-		switch index.ClassifyPath(r.RelPath) {
+		switch cl.Classify(r.RelPath) {
 		case index.PathClassTest:
 			test++
 		case index.PathClassUnknown:

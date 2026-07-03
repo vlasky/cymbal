@@ -1804,7 +1804,7 @@ func (s *Store) FindImpactScoped(symbolName, language string, depth, limit int) 
 // transitive caller chains while still admitting interop within a family.
 // A nil/empty langs set applies no restriction.
 func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limit int) ([]ImpactResult, error) {
-	results, _, err := s.findImpactInLangs(symbolName, langs, depth, limit, false)
+	results, _, err := s.findImpactInLangs(symbolName, langs, depth, limit, false, nil)
 	return results, err
 }
 
@@ -1821,7 +1821,7 @@ func (s *Store) FindImpactInLangs(symbolName string, langs []string, depth, limi
 // still explored, so production code reachable through a test isn't lost. In the
 // caller direction tests are almost always terminal, so this rarely differs from
 // pruning; it is the safer default.
-func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
+func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limit int, noTests bool, cl *Classifier) ([]ImpactResult, bool, error) {
 	depth, limit = ClampImpactBounds(depth, limit)
 
 	langFilter := ""
@@ -1882,7 +1882,7 @@ func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limi
 					nextSymbols = append(nextSymbols, caller)
 				}
 
-				if noTests && ClassifyPath(relPath) == PathClassTest {
+				if noTests && cl.Classify(relPath) == PathClassTest {
 					continue
 				}
 

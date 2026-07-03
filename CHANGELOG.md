@@ -6,6 +6,7 @@ All notable changes to cymbal are documented here.
 
 ### Added
 
+- **`--test-path` on `impact` / `changed`** — layer repo-specific test-path patterns over the built-in classification conventions (e.g. `--test-path qa/ --test-path '**/*_it.go'`). Patterns use the same semantics as the CLI `--path`/`--exclude` filters (plain substring, or glob with `**`), and affect the production/test caller split, `--no-tests`, and the exact `metrics` reference counts. Library side: `index.NewClassifier` / `Classifier.Classify`, `index.ImpactOptions` + `FindImpactWithOptions`, and `FoldReferenceCountsWith`.
 - **`impact --no-tests` now works in `--graph` mode** — previously the graph path silently ignored `--no-tests` and rendered test callers anyway. Test-classified nodes are now contracted out of the graph with hide-but-traverse semantics: a production caller reachable only through a test helper stays connected to the seed via a synthesized dashed edge marked `"indirect": true`, instead of being orphaned or silently kept.
 - **Graphs report edge-fetch truncation** — `--graph` output built from more rows than the internal per-direction fetch cap (1000) now sets `edges_truncated: true` in JSON instead of silently rendering an incomplete graph. The trace core's truncation detection now also covers the graph's unresolved-exempt mode.
 - **New test-filename conventions recognised** — `.test.cjs`/`.spec.cjs`, `.test.mts`/`.spec.mts`, `.test.cts`/`.spec.cts` (module-flavoured JS/TS), PHPUnit `*Test.php`, Kotest `*Spec.kt`, and Django `tests.py`.
