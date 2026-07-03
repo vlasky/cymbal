@@ -25,6 +25,25 @@ func TestClassifyPath(t *testing.T) {
 		{"internal/index/testdata/sample.go", PathClassTest},
 		{"e2e/login.ts", PathClassTest},
 		{"tests/helpers.rb", PathClassTest},
+		// Module-flavoured JS/TS test extensions, PHPUnit, Kotest, Django.
+		{"src/util.test.cjs", PathClassTest},
+		{"src/util.spec.mts", PathClassTest},
+		{"src/Service/OrderServiceTest.php", PathClassTest},
+		{"src/main/kotlin/OrderSpec.kt", PathClassTest},
+		{"app/tests.py", PathClassTest},
+		{"polls/tests.py", PathClassTest},
+
+		// Windows rel paths (the walker stores native separators): anchoring
+		// must survive backslashes, and the bare-convention guard ("Test.java"
+		// with no class-name prefix is production) must not invert.
+		{`tests\helpers.rb`, PathClassTest},
+		{`spec\models\user.rb`, PathClassTest},
+		{`__tests__\render.js`, PathClassTest},
+		{`src\test\java\com\x\Foo.java`, PathClassTest},
+		{`pkg\foo\bar_test.go`, PathClassTest},
+		{`nested\dir\conftest.py`, PathClassTest},
+		{`src\Test.java`, PathClassProduction},
+		{`lib\Contestant.go`, PathClassProduction},
 
 		// False-positive guards: production code that merely contains
 		// "test"/"spec" as a substring must NOT be classified as test.
