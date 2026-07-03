@@ -82,9 +82,13 @@ when truncated. Operates only on the current worktree.`,
 		}
 		out, err := exec.Command("git", append([]string{"-C", repoRoot}, diffArgs...)...).Output()
 		if err != nil {
+			// git diff (without --exit-code) only fails on real errors, so any
+			// failure must surface rather than proceed on empty output as a
+			// false "no changed symbols".
 			if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
 				return fmt.Errorf("git diff: %s", strings.TrimSpace(string(exitErr.Stderr)))
 			}
+			return fmt.Errorf("git diff: %w", err)
 		}
 
 		// Old-side blob revision per mode: index ("" -> :path) for the default
@@ -114,9 +118,16 @@ when truncated. Operates only on the current worktree.`,
 		}
 
 		skipped := 0
+		conflicted := countConflictBlocks(string(out))
 		for _, f := range parseChangedFiles(string(out)) {
 			if f.Binary {
 				skipped++
+				continue
+			}
+			if f.OldPath == "" && f.NewPath == "" && len(f.OldLines) == 0 && len(f.NewLines) == 0 {
+				// Pure rename, copy, or mode-only change: a diff block with no
+				// ---/+++ headers and no hunks. No content changed, so it is
+				// neither analyzable nor a "no parseable symbols" skip.
 				continue
 			}
 			fileParsed := false
@@ -194,7 +205,7 @@ when truncated. Operates only on the current worktree.`,
 			Impact          *impactSummary        `json:"impact,omitempty"`
 			ImpactStatus    string                `json:"impact_status,omitempty"` // "cap" | "error"
 		}
-		var results []changedResult
+		results := make([]changedResult, 0, len(analyzed))
 		impactTruncated := false
 		aggRows := 0
 		for _, name := range analyzed {
@@ -266,11 +277,14 @@ when truncated. Operates only on the current worktree.`,
 			if skipped > 0 {
 				payload["skipped_files"] = skipped
 			}
+			if conflicted > 0 {
+				payload["conflicted_files"] = conflicted
+			}
 			return writeJSON(payload)
 		}
 
 		renderWarnings := func(b *strings.Builder) {
-			if len(deletedList) == 0 && skipped == 0 {
+			if len(deletedList) == 0 && skipped == 0 && conflicted == 0 {
 				return
 			}
 			b.WriteString("\nwarnings:\n")
@@ -279,6 +293,9 @@ when truncated. Operates only on the current worktree.`,
 			}
 			if skipped > 0 {
 				fmt.Fprintf(b, "  %d changed file(s) had no parseable symbols (binary, unsupported, or non-code)\n", skipped)
+			}
+			if conflicted > 0 {
+				fmt.Fprintf(b, "  %d conflicted file(s) (unmerged) not analyzed\n", conflicted)
 			}
 		}
 
@@ -359,14 +376,26 @@ func init() {
 }
 
 // changedDiffArgs builds the git-diff argument list for the requested mode and a
-// human label for the comparison base. core.quotePath=false reduces path
-// escaping; remaining C-quoted paths are decoded when parsed.
+// human label for the comparison base. The parser assumes plain uncolored
+// unified-diff output with a/ b/ prefixes, so every user config that would
+// change that contract is pinned: core.quotePath (path escaping),
+// diff.mnemonicPrefix / diff.noprefix / diff.srcPrefix / diff.dstPrefix
+// (header prefixes; the src/dst keys are ignored by git < 2.45), --no-color
+// (color.diff=always colors piped output too), --no-textconv (line numbers
+// must match the raw blob we parse, not a textconv rendering).
 //
-//   default:  git diff           — unstaged: working tree vs index
-//   --staged: git diff --cached  — staged:   index vs HEAD
-//   --base R: git diff R         — working tree vs ref R
+//	default:  git diff           — unstaged: working tree vs index
+//	--staged: git diff --cached  — staged:   index vs HEAD
+//	--base R: git diff R --      — working tree vs ref R
 func changedDiffArgs(staged bool, base string) ([]string, string, error) {
-	common := []string{"-c", "core.quotePath=false", "diff", "--no-ext-diff", "--find-renames"}
+	common := []string{
+		"-c", "core.quotePath=false",
+		"-c", "diff.mnemonicPrefix=false",
+		"-c", "diff.noprefix=false",
+		"-c", "diff.srcPrefix=a/",
+		"-c", "diff.dstPrefix=b/",
+		"diff", "--no-ext-diff", "--no-color", "--no-textconv", "--find-renames",
+	}
 	switch {
 	case staged && base != "":
 		return nil, "", fmt.Errorf("--staged and --base are mutually exclusive")
@@ -381,7 +410,8 @@ func changedDiffArgs(staged bool, base string) ([]string, string, error) {
 			// parsing the working tree as "new" would misattribute. Out of scope.
 			return nil, "", fmt.Errorf("--base takes a single ref, not a range (%q)", base)
 		}
-		return append(common, base), base, nil
+		// Trailing "--" disambiguates the ref from a same-named file.
+		return append(common, base, "--"), base, nil
 	default:
 		return common, "working tree", nil
 	}
@@ -418,52 +448,81 @@ func parseChangedFiles(diff string) []changedFile {
 			flush()
 			cur = &changedFile{OldLines: map[int]bool{}, NewLines: map[int]bool{}}
 			inHunk = false
+		case strings.HasPrefix(line, "diff --cc "), strings.HasPrefix(line, "diff --combined "):
+			// Combined diff (merge conflict): not analyzable as a two-side diff.
+			// Flush and absorb the whole block; RunE counts these for a warning.
+			flush()
+			inHunk = false
 		case cur == nil:
 			// preamble before the first file header
-		case strings.HasPrefix(line, "Binary files "):
-			cur.Binary = true
-			inHunk = false
-		case strings.HasPrefix(line, "--- "):
-			cur.OldPath = diffPathSide(strings.TrimPrefix(line, "--- "))
-			inHunk = false
-		case strings.HasPrefix(line, "+++ "):
-			cur.NewPath = diffPathSide(strings.TrimPrefix(line, "+++ "))
-			inHunk = false
 		case strings.HasPrefix(line, "@@"):
 			if o, n, ok := parseHunkStarts(line); ok {
 				oldLine, newLine = o, n
 				inHunk = true
 			}
-		case !inHunk:
-			// metadata between header and first hunk (index, mode, rename …)
-		case strings.HasPrefix(line, "\\"):
-			// "\ No newline at end of file"
-		case strings.HasPrefix(line, "+"):
-			if newLine > 0 {
-				cur.NewLines[newLine] = true
+		case inHunk:
+			// Hunk body lines are matched before the header prefixes: a deleted
+			// line whose content starts with "-- " renders as "--- ..." (and an
+			// added "++ " as "+++ ..."), which must count as a changed line, not
+			// reopen the file header — headers only occur before the first hunk.
+			switch {
+			case strings.HasPrefix(line, "\\"):
+				// "\ No newline at end of file"
+			case strings.HasPrefix(line, "+"):
+				if newLine > 0 {
+					cur.NewLines[newLine] = true
+				}
+				newLine++
+			case strings.HasPrefix(line, "-"):
+				if oldLine > 0 {
+					cur.OldLines[oldLine] = true
+				}
+				oldLine++
+			default:
+				// context line (leading space) or blank
+				oldLine++
+				newLine++
 			}
-			newLine++
-		case strings.HasPrefix(line, "-"):
-			if oldLine > 0 {
-				cur.OldLines[oldLine] = true
-			}
-			oldLine++
+		case strings.HasPrefix(line, "Binary files "):
+			cur.Binary = true
+		case strings.HasPrefix(line, "--- "):
+			cur.OldPath = diffPathSide(strings.TrimPrefix(line, "--- "))
+		case strings.HasPrefix(line, "+++ "):
+			cur.NewPath = diffPathSide(strings.TrimPrefix(line, "+++ "))
 		default:
-			// context line (leading space) or blank
-			oldLine++
-			newLine++
+			// metadata between header and first hunk (index, mode, rename …)
 		}
 	}
 	flush()
 	return files
 }
 
+// countConflictBlocks counts combined-diff file blocks ("diff --cc"/"diff
+// --combined"), which git emits for unmerged paths mid-conflict. They cannot be
+// attributed as a two-side diff, so `changed` surfaces them as a warning
+// instead of silently ignoring them.
+func countConflictBlocks(diff string) int {
+	n := 0
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "diff --cc ") || strings.HasPrefix(line, "diff --combined ") {
+			n++
+		}
+	}
+	return n
+}
+
 // diffPathSide decodes one side of a diff file header: it un-C-quotes the path
 // (git escapes tabs, quotes, backslashes, and — without core.quotePath=false —
 // high bytes), maps /dev/null to "", and strips the a/ or b/ prefix. It must
-// not trim surrounding whitespace, which can be part of a filename.
+// not trim surrounding whitespace, which can be part of a filename — except
+// exactly one trailing tab, which git appends as a header/annotation separator
+// when the (unquoted) filename contains a space; a filename containing a real
+// tab is always C-quoted, so the quoted form never carries a separator tab.
 func diffPathSide(p string) string {
 	p = strings.TrimSuffix(p, "\r")
+	if !strings.HasPrefix(p, `"`) {
+		p = strings.TrimSuffix(p, "\t")
+	}
 	if strings.HasPrefix(p, `"`) {
 		if dec, err := strconv.Unquote(p); err == nil {
 			p = dec
@@ -557,24 +616,39 @@ func parseBlobSymbols(src []byte, path string) ([]symbols.Symbol, bool) {
 // class), deduplicated by name. Function-local declarations are skipped so a
 // change inside a body is attributed to the function, not a local on that line.
 func innermostChanged(syms []symbols.Symbol, lines map[int]bool) []symbols.Symbol {
-	seen := map[string]bool{}
-	var out []symbols.Symbol
+	if len(lines) == 0 {
+		return nil
+	}
+	sorted := make([]int, 0, len(lines))
 	for line := range lines {
-		var best *symbols.Symbol
-		for i := range syms {
-			s := &syms[i]
-			if !isChangedUnit(s.Kind, s.Depth) {
-				continue
-			}
-			if s.StartLine <= line && line <= s.EndLine {
-				if best == nil || (s.EndLine-s.StartLine) < (best.EndLine-best.StartLine) {
-					best = s
-				}
+		sorted = append(sorted, line)
+	}
+	sort.Ints(sorted)
+
+	// Per changed line, the most specific containing definition. Visiting only
+	// the changed lines inside each symbol's range (binary search into the
+	// sorted lines) avoids the O(lines × symbols) scan on huge rewrites.
+	best := make(map[int]*symbols.Symbol, len(sorted))
+	for i := range syms {
+		s := &syms[i]
+		if !isChangedUnit(s.Kind, s.Depth) {
+			continue
+		}
+		for j := sort.SearchInts(sorted, s.StartLine); j < len(sorted) && sorted[j] <= s.EndLine; j++ {
+			line := sorted[j]
+			if b := best[line]; b == nil || (s.EndLine-s.StartLine) < (b.EndLine-b.StartLine) {
+				best[line] = s
 			}
 		}
-		if best != nil && !seen[best.Name] {
-			seen[best.Name] = true
-			out = append(out, *best)
+	}
+
+	seen := map[string]bool{}
+	var out []symbols.Symbol
+	for _, line := range sorted {
+		s := best[line]
+		if s != nil && !seen[s.Name] {
+			seen[s.Name] = true
+			out = append(out, *s)
 		}
 	}
 	return out
