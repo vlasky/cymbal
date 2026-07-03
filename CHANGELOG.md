@@ -4,6 +4,28 @@ All notable changes to cymbal are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **`impact --no-tests` now works in `--graph` mode** — previously the graph path silently ignored `--no-tests` and rendered test callers anyway. Test-classified nodes are now contracted out of the graph with hide-but-traverse semantics: a production caller reachable only through a test helper stays connected to the seed via a synthesized dashed edge marked `"indirect": true`, instead of being orphaned or silently kept.
+- **Graphs report edge-fetch truncation** — `--graph` output built from more rows than the internal per-direction fetch cap (1000) now sets `edges_truncated: true` in JSON instead of silently rendering an incomplete graph. The trace core's truncation detection now also covers the graph's unresolved-exempt mode.
+- **New test-filename conventions recognised** — `.test.cjs`/`.spec.cjs`, `.test.mts`/`.spec.mts`, `.test.cts`/`.spec.cts` (module-flavoured JS/TS), PHPUnit `*Test.php`, Kotest `*Spec.kt`, and Django `tests.py`.
+
+### Changed
+
+- **BREAKING: `investigate --json` now returns one stable object shape for any symbol count** — previously a single symbol emitted a bare object and a batch emitted a bare array, so piped batches (`--stdin`) flipped shape based on how many names survived dedup. Both now emit `{symbols, resolve_scope, results: [...]}` (matching `trace`/`impact`), and every per-symbol entry carries its own `symbol` key (previously only error entries did).
+- **`trace` reports the effective (clamped) depth** — `trace --depth 10` used to echo `depth: 10` in frontmatter/JSON while actually traversing the maximum of 5; the reported depth now matches the traversal (`index.ClampTraceDepth`).
+
+### Fixed
+
+- **`changed`: in-hunk lines starting with `-- `/`++ ` are no longer misparsed as file headers** — a deleted line whose content begins with `-- ` renders in a unified diff as `--- …` (every deleted Lua comment; any block-comment content), which the parser previously treated as a `---` file header: it clobbered the file's paths and silently dropped the rest of the hunk's changed symbols. Hunk-body lines are now matched before header prefixes, which git only emits before a file's first hunk.
+- **`changed`: filenames containing spaces are now analyzed** — git appends a tab separator after unquoted header paths containing a space (`--- a/my file.go\t`); the parser kept the tab, so both blob reads failed and the file was miscounted as "no parseable symbols". Exactly one trailing tab is now stripped (safe: a filename with a real tab is always C-quoted).
+- **`changed`: user git config can no longer silently empty the results** — `diff.mnemonicPrefix=true` (headers become `i/`/`w/`), `diff.noprefix`, `diff.srcPrefix`/`dstPrefix`, `color.diff=always` (ANSI codes even when piped), and textconv drivers each broke the diff contract the parser assumes, producing "No changed symbols found" with no error. The git invocation now pins all of them (`-c` overrides plus `--no-color --no-textconv`).
+- **`changed`: real `git diff` failures now surface as errors** — a failure without stderr (or a non-exit error) was previously swallowed, and the run proceeded on empty output as a false "no changed symbols".
+- **`changed`: pure renames and mode-only changes are no longer miscounted** as "changed file(s) had no parseable symbols"; merge-conflict (unmerged) files, previously invisible, are now counted and warned about (`conflicted_files` in JSON).
+- **`changed --base <ref>`**: the ref is now separated from paths with `--`, so a file named like the ref (e.g. `main`) no longer makes git fail with "ambiguous argument"; `--json` emits `"results": []` instead of `null` when no symbols changed.
+- **Path classification now works on Windows** — the index stores rel paths with native separators, so every anchored pattern (`/tests/`, `src/test/java`, …) silently failed to match on Windows: `--no-tests` hid nothing, the production/test splits reported test code as production, and `search` ranking's test-file penalty never applied. `ClassifyPath` now normalizes `\` to `/` (and the bare-convention guard no longer inverts on `src\Test.java`).
+- **Impact/trace BFS no longer re-queries duplicate frontier entries** — a caller reached via several files (or a callee reached from several callers) was enqueued once per encounter and re-queried at the next depth; results were already deduplicated, so this was pure wasted SQL on hot symbols.
+
 ## [0.14.0] - 2026-06-20
 
 ### Added

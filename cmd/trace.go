@@ -51,6 +51,9 @@ Examples:
 		ensureFresh(plan.Primary)
 		jsonOut := getJSONFlag(cmd)
 		depth, _ := cmd.Flags().GetInt("depth")
+		// Report the depth the BFS actually traverses, not the raw flag —
+		// the store clamps to [1, 5] (and defaults non-positive to 3).
+		depth = index.ClampTraceDepth(depth)
 		limit, _ := cmd.Flags().GetInt("limit")
 		kindsRaw, _ := cmd.Flags().GetString("kinds")
 		kinds := parseKindsFlag(kindsRaw)
@@ -79,7 +82,6 @@ Examples:
 
 		opts := index.TraceOptions{IncludeUnresolved: includeUnresolved, Scope: scope}
 		merged, sourceMap, labelMap, totalRaw, truncated, err := mergeTracePlan(plan, names, depth, limit, kinds, opts)
-		_ = labelMap
 		if err != nil {
 			return err
 		}

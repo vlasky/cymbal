@@ -70,6 +70,11 @@ type GraphQuery struct {
 	// single sentinel node is appended to make truncation visible.
 	// The root symbol is always kept. Zero means no cap.
 	Limit int
+	// NoTests contracts test-classified symbol nodes out of the graph — the
+	// graph analog of impact's hide-but-traverse: the test node is removed,
+	// and callers reachable only through it stay connected to its targets via
+	// synthesized indirect edges (see GraphEdge.Indirect). The root is exempt.
+	NoTests bool
 }
 
 type GraphNode struct {
@@ -84,7 +89,7 @@ type GraphNode struct {
 	// resolution is name-only, distinct same-named symbols collapse into this
 	// single node; the annotation lets a consumer see the conflation and
 	// investigate each definition. Both are omitted unless count > 1.
-	DefinitionCount int              `json:"definition_count,omitempty"`
+	DefinitionCount int               `json:"definition_count,omitempty"`
 	Definitions     []GraphDefinition `json:"definitions,omitempty"`
 }
 
@@ -100,6 +105,10 @@ type GraphEdge struct {
 	To       string        `json:"to"`
 	Kind     GraphEdgeKind `json:"kind"`
 	Resolved bool          `json:"resolved"`
+	// Indirect marks a contracted edge: From reaches To through one or more
+	// hidden intermediate nodes (e.g. test callers removed by NoTests), not by
+	// a direct call. Rendered dashed like unresolved edges.
+	Indirect bool `json:"indirect,omitempty"`
 }
 
 type GraphUnresolved struct {
@@ -117,6 +126,10 @@ type GraphResult struct {
 	// Truncated reports how many nodes were dropped by the Limit cap.
 	// Zero when no truncation happened.
 	Truncated int `json:"truncated,omitempty"`
+	// EdgesTruncated reports that the underlying trace/impact row fetch hit
+	// its internal cap, so the graph is incomplete even if no node-limit
+	// truncation happened (Truncated == 0).
+	EdgesTruncated bool `json:"edges_truncated,omitempty"`
 	// ResolveScope is the active cross-language resolution scope (down/trace
 	// direction). Empty when not applicable (e.g. importer/impls graphs).
 	ResolveScope ResolveScope `json:"resolve_scope,omitempty"`
@@ -207,6 +220,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 	}
 
 	builder := newGraphBuilder(q, metas)
+	edgesTruncated := false
 	if graphDirectionIncludesDown(q.Direction) {
 		// Always collect unresolved callees so GraphResult.Unresolved
 		// diagnostics are populated regardless of q.IncludeUnresolved;
@@ -214,7 +228,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 		// rendered. UnresolvedExemptFromLimit makes the 1000 cap bound only
 		// resolved traversal breadth, so external/scope-filtered calls don't
 		// crowd it out — the unresolved diagnostics themselves are not capped.
-		rows, err := s.FindTraceWithOptions(q.Symbol, q.Depth, 1000, TraceOptions{
+		rows, truncated, err := s.findTraceWithOptions(q.Symbol, q.Depth, graphEdgeRowCap, TraceOptions{
 			IncludeUnresolved:         true,
 			UnresolvedExemptFromLimit: true,
 			Scope:                     q.ResolveScope,
@@ -222,6 +236,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 		if err != nil {
 			return nil, err
 		}
+		edgesTruncated = edgesTruncated || truncated
 		builder.addTraceRows(rows)
 	}
 
@@ -234,22 +249,32 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 				langs = scopeLanguagesUnion(seedLangs, q.ResolveScope)
 			}
 		}
-		rows, err := s.FindImpactInLangs(q.Symbol, langs, q.Depth, 1000)
+		rows, truncated, err := s.findImpactInLangs(q.Symbol, langs, q.Depth, graphEdgeRowCap, false)
 		if err != nil {
 			return nil, err
 		}
+		edgesTruncated = edgesTruncated || truncated
 		builder.addImpactRows(rows)
 	}
 	builder.addRoot()
 
 	result := builder.result()
+	if q.NoTests {
+		result = contractTestNodes(result, graphNodeID(q.Symbol))
+	}
 	if q.Limit > 0 && len(result.Nodes) > q.Limit {
 		result = truncateByDegree(result, q.Limit, graphNodeID(q.Symbol))
 	}
-	// Set last so it survives builder.result and truncation.
+	// Set last so they survive builder.result, contraction, and truncation.
 	result.ResolveScope = NormalizeScope(q.ResolveScope)
+	result.EdgesTruncated = edgesTruncated
 	return result, nil
 }
+
+// graphEdgeRowCap bounds the underlying trace/impact row fetch per direction.
+// When the cap is hit, GraphResult.EdgesTruncated reports the graph as
+// incomplete rather than truncating silently.
+const graphEdgeRowCap = 1000
 
 func normalizeGraphQuery(q GraphQuery) GraphQuery {
 	if q.Depth <= 0 {
@@ -517,6 +542,106 @@ func truncateByDegree(g *GraphResult, limit int, rootID string) *GraphResult {
 		Edges:      filteredEdges,
 		Unresolved: filteredUnresolved,
 		Truncated:  dropped,
+	}
+}
+
+// contractTestNodes removes test-classified symbol nodes from a graph while
+// preserving connectivity — the graph analog of impact's --no-tests
+// hide-but-traverse semantics. Dropping a test node outright would orphan a
+// production caller whose only path to the seed runs through a test helper, so
+// each edge into a dropped node is rewired to that node's surviving targets as
+// an Indirect edge. A node is contracted only when its definition file
+// classifies confidently as test (unknown/ambiguous stay), and the root never
+// is. A direct edge between two survivors always wins over a synthesized one.
+func contractTestNodes(g *GraphResult, rootID string) *GraphResult {
+	drop := map[string]bool{}
+	for _, n := range g.Nodes {
+		if n.ID == rootID || n.Kind != GraphNodeKindSymbol {
+			continue
+		}
+		if n.Path != "" && ClassifyPath(n.Path) == PathClassTest {
+			drop[n.ID] = true
+		}
+	}
+	if len(drop) == 0 {
+		return g
+	}
+
+	out := map[string][]string{}
+	for _, e := range g.Edges {
+		out[e.From] = append(out[e.From], e.To)
+	}
+	// survivingTargets walks forward from a dropped node, through any chain of
+	// dropped nodes (cycle-safe), to the surviving nodes it ultimately reaches.
+	survivingTargets := func(start string) []string {
+		var targets []string
+		seen := map[string]bool{}
+		visited := map[string]bool{start: true}
+		queue := []string{start}
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			for _, to := range out[id] {
+				switch {
+				case drop[to]:
+					if !visited[to] {
+						visited[to] = true
+						queue = append(queue, to)
+					}
+				case !seen[to]:
+					seen[to] = true
+					targets = append(targets, to)
+				}
+			}
+		}
+		return targets
+	}
+
+	edges := map[string]GraphEdge{}
+	edgeKey := func(from, to string) string { return from + "|" + to }
+	for _, e := range g.Edges {
+		if !drop[e.From] && !drop[e.To] {
+			edges[edgeKey(e.From, e.To)] = e
+		}
+	}
+	for _, e := range g.Edges {
+		if drop[e.From] || !drop[e.To] {
+			continue
+		}
+		for _, t := range survivingTargets(e.To) {
+			if t == e.From {
+				continue // recursion through a hidden node: no self-edge
+			}
+			if k := edgeKey(e.From, t); edges[k].From == "" {
+				edges[k] = GraphEdge{From: e.From, To: t, Kind: e.Kind, Resolved: true, Indirect: true}
+			}
+		}
+	}
+
+	kept := make([]GraphNode, 0, len(g.Nodes)-len(drop))
+	for _, n := range g.Nodes {
+		if !drop[n.ID] {
+			kept = append(kept, n)
+		}
+	}
+	unresolved := make([]GraphUnresolved, 0, len(g.Unresolved))
+	for _, u := range g.Unresolved {
+		if !drop[u.From] {
+			unresolved = append(unresolved, u)
+		}
+	}
+
+	return &GraphResult{
+		Nodes: kept,
+		Edges: mapValuesSorted(edges, func(a, b GraphEdge) bool {
+			if a.From != b.From {
+				return a.From < b.From
+			}
+			return a.To < b.To
+		}),
+		Unresolved:   unresolved,
+		Truncated:    g.Truncated,
+		ResolveScope: g.ResolveScope,
 	}
 }
 

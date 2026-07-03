@@ -379,6 +379,9 @@ references: 39 (8 production, 31 test) in 12 (4 production, 8 test)
   name (several definitions) is flagged via `definition_count` / `definitions`.
 - `--no-tests` drops test-file callers; classification happens during traversal,
   so test callers never consume the `--limit` budget ahead of production ones.
+  In `--graph` mode, hidden test nodes are contracted: a production caller
+  reachable only through a test helper stays connected to the seed via a dashed
+  edge marked `"indirect": true` in the JSON.
 
 ```sh
 # only the production callers worth inspecting

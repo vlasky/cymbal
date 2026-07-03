@@ -23,13 +23,13 @@ func TestScopeLanguages(t *testing.T) {
 		scope ResolveScope
 		want  []string // sorted; nil means unrestricted
 	}{
-		{"", ResolveScopeFamily, nil},      // empty seed -> unrestricted
-		{"go", ResolveScopeAll, nil},       // all -> unrestricted
+		{"", ResolveScopeFamily, nil}, // empty seed -> unrestricted
+		{"go", ResolveScopeAll, nil},  // all -> unrestricted
 		{"go", ResolveScopeSame, []string{"go"}},
 		{"kotlin", ResolveScopeSame, []string{"kotlin"}},
 		{"kotlin", ResolveScopeFamily, []string{"java", "kotlin", "scala"}},
 		{"typescript", ResolveScopeFamily, []string{"javascript", "tsx", "typescript"}},
-		{"go", ResolveScopeFamily, []string{"go"}},      // no family -> self
+		{"go", ResolveScopeFamily, []string{"go"}},       // no family -> self
 		{"cobol", ResolveScopeFamily, []string{"cobol"}}, // unknown -> self
 		{"go", "", []string{"go"}},                       // empty scope normalizes to family
 	}

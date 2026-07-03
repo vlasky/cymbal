@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1540,6 +1541,19 @@ func (s *Store) FindTrace(symbolName string, depth, limit int, kinds ...string) 
 	return s.FindTraceWithOptions(symbolName, depth, limit, TraceOptions{}, kinds...)
 }
 
+// ClampTraceDepth normalizes a requested depth to the value the trace BFS
+// actually uses: [1, 5], defaulting to 3 for a non-positive request. Exported
+// so the CLI reports the effective depth rather than echoing the raw flag.
+func ClampTraceDepth(depth int) int {
+	if depth <= 0 {
+		return 3
+	}
+	if depth > 5 {
+		return 5
+	}
+	return depth
+}
+
 // FindTraceWithOptions is FindTrace with explicit control over filtering behavior.
 func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, error) {
 	results, _, err := s.findTraceWithOptions(symbolName, depth, limit, opts, kinds...)
@@ -1548,23 +1562,17 @@ func (s *Store) FindTraceWithOptions(symbolName string, depth, limit int, opts T
 
 // findTraceWithOptions is the trace BFS core; the bool reports whether the
 // per-query limit truncated the result set. Truncation is detected by
-// over-fetching one row past the limit, then trimming — but only on the normal
-// path. The graph builder exempts unresolved rows from the limit
-// (UnresolvedExemptFromLimit), where len(results) legitimately exceeds limit, so
-// it is neither over-fetched nor trimmed.
+// over-fetching one budget-consuming row past the limit, then trimming that
+// row. Under UnresolvedExemptFromLimit (the graph builder) only resolved rows
+// consume budget, so len(results) may legitimately exceed limit; the
+// over-fetched row is still the last appended one, so the trim stays exact.
 func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts TraceOptions, kinds ...string) ([]TraceResult, bool, error) {
-	if depth <= 0 {
-		depth = 3
-	}
-	if depth > 5 {
-		depth = 5
-	}
-	// Over-fetch one past the limit to detect truncation — but only on the
-	// normal path with a positive limit. The graph builder exempts unresolved
-	// rows (UnresolvedExemptFromLimit) and must not be trimmed; a non-positive
-	// limit keeps its prior store-level meaning (no normalization here, so
-	// direct callers are unaffected — the package wrapper does its own clamp).
-	overfetch := !opts.UnresolvedExemptFromLimit && limit > 0
+	depth = ClampTraceDepth(depth)
+	// Over-fetch one budget-consuming row past the limit to detect truncation.
+	// A non-positive limit keeps its prior store-level meaning (no
+	// normalization here, so direct callers are unaffected — the package
+	// wrapper does its own clamp).
+	overfetch := limit > 0
 	budget := limit
 	if overfetch {
 		budget = limit + 1
@@ -1650,6 +1658,7 @@ func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts T
 	}
 
 	seen := make(map[string]bool)
+	queriedLocs := map[string]bool{}
 	var results []TraceResult
 	// limited counts results that consume the limit budget. It equals
 	// len(results) unless unresolved rows are exempted (see TraceOptions),
@@ -1658,6 +1667,9 @@ func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts T
 	// The seed is resolved across all languages; callees are then constrained
 	// to their caller's resolution scope below.
 	currentLocs := resolveSymbol(symbolName, nil)
+	for _, loc := range currentLocs {
+		queriedLocs[loc.file+"\x00"+strconv.Itoa(loc.startLine)+"\x00"+loc.name] = true
+	}
 
 	for d := 1; d <= depth && len(currentLocs) > 0 && limited < budget; d++ {
 		var nextLocs []symLoc
@@ -1690,9 +1702,16 @@ func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts T
 				results = append(results, tr)
 
 				// Only resolved callees expand the frontier; unresolved ones
-				// are terminal leaves (nextSymLocs is empty).
+				// are terminal leaves (nextSymLocs is empty). Dedupe enqueued
+				// locations: a callee reached from several callers (or again
+				// at a later depth) yields identical callee rows, all already
+				// dropped by seen — re-querying it is wasted SQL.
 				for _, nextLoc := range nextSymLocs {
-					nextLocs = append(nextLocs, nextLoc)
+					lk := nextLoc.file + "\x00" + strconv.Itoa(nextLoc.startLine) + "\x00" + nextLoc.name
+					if !queriedLocs[lk] {
+						queriedLocs[lk] = true
+						nextLocs = append(nextLocs, nextLoc)
+					}
 				}
 
 				// Unresolved leaves don't consume the budget when exempted, so
@@ -1702,8 +1721,10 @@ func (s *Store) findTraceWithOptions(symbolName string, depth, limit int, opts T
 					if limited >= budget {
 						if overfetch {
 							// We collected one past the limit, so a further
-							// callee genuinely exists: report truncation.
-							return results[:limit], true, nil
+							// callee genuinely exists: drop the over-fetched
+							// row (the one just appended) and report
+							// truncation.
+							return results[:len(results)-1], true, nil
 						}
 						return results, false, nil
 					}
@@ -1815,6 +1836,10 @@ func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limi
 	fetchTarget := limit + 1
 
 	seen := make(map[string]bool)
+	// queried dedupes the BFS frontier by caller name: re-querying a name at a
+	// later depth (reached via a different file) returns the same ref rows,
+	// all already dropped by seen — pure wasted SQL on hot symbols.
+	queried := map[string]bool{symbolName: true}
 	var results []ImpactResult
 	currentSymbols := []string{symbolName}
 
@@ -1852,7 +1877,10 @@ func (s *Store) findImpactInLangs(symbolName string, langs []string, depth, limi
 
 				// Traverse through the caller regardless, so production code
 				// behind a (hidden) test caller is still discovered.
-				nextSymbols = append(nextSymbols, caller)
+				if !queried[caller] {
+					queried[caller] = true
+					nextSymbols = append(nextSymbols, caller)
+				}
 
 				if noTests && ClassifyPath(relPath) == PathClassTest {
 					continue
