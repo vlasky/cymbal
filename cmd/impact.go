@@ -57,7 +57,6 @@ Examples:
 		if err != nil {
 			return err
 		}
-		_ = labelMap // attached to meta below
 		if len(merged) == 0 {
 			if len(names) == 1 {
 				return fmt.Errorf("no callers found for '%s'", names[0])

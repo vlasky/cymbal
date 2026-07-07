@@ -109,6 +109,133 @@ Binary files a/logo.png and b/logo.png differ
 	}
 }
 
+// A deleted line whose content starts with "-- " renders in the diff as
+// "--- ..." (hunk marker + content), and an added "++ " line as "+++ ...".
+// These are hunk body lines and must never be parsed as file headers — doing
+// so clobbers the paths and silently drops the rest of the hunk. Lua hits this
+// on every deleted comment; any language hits it via block-comment content.
+func TestParseChangedFilesHunkContentNotMistakenForHeaders(t *testing.T) {
+	diff := `diff --git a/p.lua b/p.lua
+index abc..def 100644
+--- a/p.lua
++++ b/p.lua
+@@ -1,6 +1,6 @@
+ local x = 1
+--- old comment
++-- new comment
+ local y = 2
+-function alpha() end
++function alpha() return 1 end
+diff --git a/q.go b/q.go
+index abc..def 100644
+--- a/q.go
++++ b/q.go
+@@ -1,3 +1,2 @@
+ package q
+-/* ++ emphasised ++ */
+ var V = 1
+`
+	files := parseChangedFiles(diff)
+	if len(files) != 2 {
+		t.Fatalf("parsed %d files, want 2: %+v", len(files), files)
+	}
+	lua := files[0]
+	if lua.OldPath != "p.lua" || lua.NewPath != "p.lua" {
+		t.Errorf("lua paths = (%q, %q), want (p.lua, p.lua) — header clobbered by hunk content", lua.OldPath, lua.NewPath)
+	}
+	if got, want := sortedInts(lua.OldLines), []int{2, 4}; !reflect.DeepEqual(got, want) {
+		t.Errorf("lua old lines = %v, want %v (comment deletion and later change both tracked)", got, want)
+	}
+	if got, want := sortedInts(lua.NewLines), []int{2, 4}; !reflect.DeepEqual(got, want) {
+		t.Errorf("lua new lines = %v, want %v", got, want)
+	}
+	goFile := files[1]
+	if goFile.OldPath != "q.go" || goFile.NewPath != "q.go" {
+		t.Errorf("go paths = (%q, %q), want (q.go, q.go) — header clobbered by '++' content", goFile.OldPath, goFile.NewPath)
+	}
+	if got, want := sortedInts(goFile.OldLines), []int{2}; !reflect.DeepEqual(got, want) {
+		t.Errorf("go old lines = %v, want %v", got, want)
+	}
+}
+
+// Combined-diff blocks (merge conflicts) must be absorbed without corrupting
+// neighbouring files, and counted for the warning.
+func TestParseChangedFilesAbsorbsCombinedDiffBlocks(t *testing.T) {
+	diff := `diff --cc conflicted.go
+index c105347,810f6e5..0000000
+--- a/conflicted.go
++++ b/conflicted.go
+@@@ -1,3 -1,3 +1,7 @@@
+  package p
+++<<<<<<< HEAD
+ +func A() int { return 1 }
+++=======
++ func A() int { return 2 }
+++>>>>>>> other
+diff --git a/clean.go b/clean.go
+index abc..def 100644
+--- a/clean.go
++++ b/clean.go
+@@ -1,2 +1,3 @@
+ package p
++var V = 1
+`
+	files := parseChangedFiles(diff)
+	if len(files) != 1 {
+		t.Fatalf("parsed %d files, want 1 (combined block absorbed): %+v", len(files), files)
+	}
+	if files[0].NewPath != "clean.go" {
+		t.Errorf("surviving file = %q, want clean.go", files[0].NewPath)
+	}
+	if got, want := sortedInts(files[0].NewLines), []int{2}; !reflect.DeepEqual(got, want) {
+		t.Errorf("clean.go new lines = %v, want %v", got, want)
+	}
+	if got := countConflictBlocks(diff); got != 1 {
+		t.Errorf("countConflictBlocks = %d, want 1", got)
+	}
+}
+
+// Pure renames and mode-only changes produce diff blocks with no ---/+++
+// headers and no hunks; they carry no content change and must not be reported
+// as "no parseable symbols" skips.
+func TestParseChangedFilesPureRenameAndModeOnly(t *testing.T) {
+	diff := `diff --git a/ren.go b/renamed.go
+similarity index 100%
+rename from ren.go
+rename to renamed.go
+diff --git a/script.sh b/script.sh
+old mode 100644
+new mode 100755
+`
+	for _, f := range parseChangedFiles(diff) {
+		if f.Binary || f.OldPath != "" || f.NewPath != "" || len(f.OldLines) != 0 || len(f.NewLines) != 0 {
+			t.Errorf("rename/mode-only block should parse to an empty entry, got %+v", f)
+		}
+	}
+}
+
+func TestChangedDiffArgsPinsOutputContract(t *testing.T) {
+	args, label, err := changedDiffArgs(false, "main")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if label != "main" {
+		t.Errorf("label = %q, want main", label)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"core.quotePath=false", "diff.mnemonicPrefix=false", "diff.noprefix=false",
+		"--no-color", "--no-textconv",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("diff args missing %q: %v", want, args)
+		}
+	}
+	if args[len(args)-1] != "--" || args[len(args)-2] != "main" {
+		t.Errorf("base ref must be followed by \"--\" to disambiguate from paths: %v", args)
+	}
+}
+
 func TestDiffPathSideDecodesQuotedAndStripsPrefix(t *testing.T) {
 	cases := map[string]string{
 		"a/foo.go":          "foo.go",
@@ -117,6 +244,9 @@ func TestDiffPathSideDecodesQuotedAndStripsPrefix(t *testing.T) {
 		`"b/with space.go"`: "with space.go",
 		`"a/tab\there.go"`:  "tab\there.go",
 		"a/b/keep.go":       "b/keep.go", // only the leading a/ is stripped
+		// git appends a tab separator after unquoted names containing a space;
+		// a name with a real tab is always C-quoted, so this trim is safe.
+		"a/my file.go\t": "my file.go",
 	}
 	for in, want := range cases {
 		if got := diffPathSide(in); got != want {

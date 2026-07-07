@@ -558,3 +558,94 @@ func TestBuildGraphImpactSameNameCallerSurvivesExclude(t *testing.T) {
 		t.Fatalf("expected resolved Caller->Target impact edge, got %+v", g.Edges)
 	}
 }
+
+// NoTests must contract test-classified caller nodes out of the impact graph
+// with hide-but-traverse semantics: the test node disappears, a production
+// caller reachable only through it stays connected via an Indirect edge, and
+// direct production edges are untouched.
+func TestBuildGraphNoTestsContractsTestCallers(t *testing.T) {
+	store, _ := newTestStore(t)
+	now := time.Now()
+
+	appID, _ := store.UpsertFile("/repo/app/app.go", "app/app.go", "go", "h1", now, 100)
+	if err := store.InsertSymbols(appID, []symbols.Symbol{
+		{Name: "Target", Kind: "function", File: "/repo/app/app.go", StartLine: 1, EndLine: 10, Language: "go"},
+		{Name: "Direct", Kind: "function", File: "/repo/app/app.go", StartLine: 11, EndLine: 20, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(appID, []symbols.Ref{
+		{Name: "Target", Line: 12, Language: "go", Kind: symbols.RefKindCall}, // Direct -> Target
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	testID, _ := store.UpsertFile("/repo/tests/helper_test.go", "tests/helper_test.go", "go", "h2", now, 100)
+	if err := store.InsertSymbols(testID, []symbols.Symbol{
+		{Name: "RunScenario", Kind: "function", File: "/repo/tests/helper_test.go", StartLine: 1, EndLine: 10, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(testID, []symbols.Ref{
+		{Name: "Target", Line: 2, Language: "go", Kind: symbols.RefKindCall}, // RunScenario -> Target
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mainID, _ := store.UpsertFile("/repo/app/main.go", "app/main.go", "go", "h3", now, 100)
+	if err := store.InsertSymbols(mainID, []symbols.Symbol{
+		{Name: "Main", Kind: "function", File: "/repo/app/main.go", StartLine: 1, EndLine: 10, Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertRefs(mainID, []symbols.Ref{
+		{Name: "RunScenario", Line: 2, Language: "go", Kind: symbols.RefKindCall}, // Main -> RunScenario
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Baseline: without NoTests the test caller is a normal node.
+	g, err := store.BuildGraph(GraphQuery{Symbol: "Target", Direction: GraphDirectionUp, Depth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !graphHasNode(g, "RunScenario") {
+		t.Fatalf("baseline graph should contain the test caller, got %+v", g.Nodes)
+	}
+
+	g, err = store.BuildGraph(GraphQuery{Symbol: "Target", Direction: GraphDirectionUp, Depth: 3, NoTests: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graphHasNode(g, "RunScenario") {
+		t.Fatalf("NoTests graph must not contain the test caller, got %+v", g.Nodes)
+	}
+	if !graphHasNode(g, "Main") || !graphHasNode(g, "Direct") {
+		t.Fatalf("production callers must survive contraction, got %+v", g.Nodes)
+	}
+	var mainEdge, directEdge *GraphEdge
+	for i := range g.Edges {
+		e := &g.Edges[i]
+		if e.From == graphNodeID("Main") && e.To == graphNodeID("Target") {
+			mainEdge = e
+		}
+		if e.From == graphNodeID("Direct") && e.To == graphNodeID("Target") {
+			directEdge = e
+		}
+	}
+	if mainEdge == nil || !mainEdge.Indirect || !mainEdge.Resolved {
+		t.Fatalf("Main must reach Target via a resolved Indirect edge, got %+v", g.Edges)
+	}
+	if directEdge == nil || directEdge.Indirect {
+		t.Fatalf("Direct's edge must stay a plain direct edge, got %+v", g.Edges)
+	}
+}
+
+func graphHasNode(g *GraphResult, symbol string) bool {
+	for _, n := range g.Nodes {
+		if n.ID == graphNodeID(symbol) {
+			return true
+		}
+	}
+	return false
+}

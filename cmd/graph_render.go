@@ -135,6 +135,9 @@ func mergeGraphResults(graphs ...*index.GraphResult) *index.GraphResult {
 		if g.Truncated > 0 {
 			merged.Truncated += g.Truncated
 		}
+		if g.EdgesTruncated {
+			merged.EdgesTruncated = true
+		}
 		for _, n := range g.Nodes {
 			if !seenNodes[n.ID] {
 				seenNodes[n.ID] = true
@@ -188,6 +191,11 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 	depth := graphDepthOrDefault(cmd, graphDefaultDepth)
 	includeUnresolved, _ := cmd.Flags().GetBool("include-unresolved")
 	scope := resolveScopeFlag(cmd)
+	// Only impact defines --no-tests; on other verbs the lookup returns false.
+	noTests := false
+	if cmd.Flags().Lookup("no-tests") != nil {
+		noTests, _ = cmd.Flags().GetBool("no-tests")
+	}
 
 	graphs := make([]*index.GraphResult, 0, len(symbols))
 	rootIDs := make(map[string]bool, len(symbols))
@@ -198,6 +206,7 @@ func renderAsGraph(cmd *cobra.Command, dbPath string, symbols []string, directio
 			Depth:             depth,
 			IncludeUnresolved: includeUnresolved,
 			ResolveScope:      scope,
+			NoTests:           noTests,
 		}
 		g, err := index.BuildGraph(dbPath, q)
 		if err != nil {
@@ -490,7 +499,7 @@ func renderGraphMermaid(graph *index.GraphResult) string {
 	}
 	for _, edge := range graph.Edges {
 		arrow := "-->"
-		if !edge.Resolved {
+		if !edge.Resolved || edge.Indirect {
 			arrow = "-.->"
 		}
 		fmt.Fprintf(&b, "  %s %s %s\n", edge.From, arrow, edge.To)
@@ -509,7 +518,7 @@ func renderGraphDOT(graph *index.GraphResult) string {
 	}
 	for _, edge := range graph.Edges {
 		attrs := ""
-		if !edge.Resolved {
+		if !edge.Resolved || edge.Indirect {
 			attrs = " [style=dashed]"
 		}
 		fmt.Fprintf(&b, "  %s -> %s%s;\n", edge.From, edge.To, attrs)

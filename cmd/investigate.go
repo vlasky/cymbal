@@ -46,17 +46,26 @@ Examples:
 			return err
 		}
 
-		if jsonOut && len(names) > 1 {
-			var all []any
+		if jsonOut {
+			// One object shape for any symbol count (matching trace/impact):
+			// an envelope with the requested symbols and one entry per symbol,
+			// each carrying its own "symbol" key so consumers don't have to
+			// correlate by array order.
+			results := make([]map[string]any, 0, len(names))
 			for _, name := range names {
 				entry, _ := findSymbolEntry(plan, name)
 				data := investigateOne(entry.Path, name, scope)
+				data["symbol"] = name
 				if label := entry.Label(); label != "" {
 					data["worktree"] = label
 				}
-				all = append(all, data)
+				results = append(results, data)
 			}
-			return writeJSON(all)
+			return writeJSON(map[string]any{
+				"symbols":       names,
+				"resolve_scope": string(index.NormalizeScope(scope)),
+				"results":       results,
+			})
 		}
 
 		for i, name := range names {
@@ -64,7 +73,7 @@ Examples:
 				fmt.Println()
 			}
 			entry, _ := findSymbolEntry(plan, name)
-			if err := investigateOnePrint(entry.Path, name, jsonOut, entry.Label(), scope); err != nil {
+			if err := investigateOnePrint(entry.Path, name, false, entry.Label(), scope); err != nil {
 				fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
 			}
 		}

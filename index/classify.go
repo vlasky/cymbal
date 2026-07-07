@@ -45,8 +45,8 @@ var ambiguousDirSegments = []string{
 var lowerTestSuffixes = []string{
 	"_test.go", "_test.py", "_test.rb", "_test.exs", "_test.ex",
 	"_spec.rb",
-	".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".test.mjs",
-	".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx", ".spec.mjs",
+	".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".test.mjs", ".test.cjs", ".test.mts", ".test.cts",
+	".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx", ".spec.mjs", ".spec.cjs", ".spec.mts", ".spec.cts",
 }
 
 // camelTestSuffixes are CamelCase class-filename conventions (Java/Kotlin/C#/
@@ -54,17 +54,21 @@ var lowerTestSuffixes = []string{
 // "Manifest.cs" do not false-match.
 var camelTestSuffixes = []string{
 	"Test.java", "Tests.java", "IT.java", "ITCase.java",
-	"Test.kt", "Tests.kt",
+	"Test.kt", "Tests.kt", "Spec.kt",
 	"Test.cs", "Tests.cs",
 	"Test.scala", "Spec.scala",
+	"Test.php",
 }
 
-// ClassifyPath returns the PathClass for a repo-relative file path. The index
-// stores rel paths with "/" separators; callers should pass those directly.
+// ClassifyPath returns the PathClass for a repo-relative file path. Windows
+// backslash separators are normalized here: the walker stores rel paths in
+// native form, and every anchored pattern below assumes "/" — without this,
+// classification silently reports everything as production on Windows.
 func ClassifyPath(relPath string) PathClass {
 	if relPath == "" {
 		return PathClassUnknown
 	}
+	relPath = strings.ReplaceAll(relPath, "\\", "/")
 	p := strings.ToLower(relPath)
 	base := p
 	baseOrig := relPath
@@ -86,7 +90,7 @@ func ClassifyPath(relPath string) PathClass {
 			return PathClassTest
 		}
 	}
-	if base == "conftest.py" {
+	if base == "conftest.py" || base == "tests.py" {
 		return PathClassTest
 	}
 	if (strings.HasPrefix(base, "test_")) &&
