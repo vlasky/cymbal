@@ -77,3 +77,33 @@ func TestClassifyPath(t *testing.T) {
 		}
 	}
 }
+
+func TestClassifierTestPathPatterns(t *testing.T) {
+	// nil classifier == built-ins only.
+	var nilCl *Classifier
+	if got := nilCl.Classify("qa/scenario.go"); got != PathClassProduction {
+		t.Errorf("nil classifier Classify(qa/scenario.go) = %q, want production", got)
+	}
+	if NewClassifier(nil) != nil || NewClassifier([]string{"", "  "}) != nil {
+		t.Error("NewClassifier with no usable patterns should return nil")
+	}
+
+	cl := NewClassifier([]string{"qa/", "**/*_it.go"})
+	cases := []struct {
+		path string
+		want PathClass
+	}{
+		{"qa/scenario.go", PathClassTest},          // substring pattern
+		{"services/qa/checks.rb", PathClassTest},   // substring anywhere
+		{"pkg/orders/orders_it.go", PathClassTest}, // glob with **
+		{"pkg/orders/orders.go", PathClassProduction},
+		{"index/store_test.go", PathClassTest}, // built-ins still apply
+		{`qa\scenario.go`, PathClassTest},      // windows separators normalized
+		{"", PathClassUnknown},
+	}
+	for _, c := range cases {
+		if got := cl.Classify(c.path); got != c.want {
+			t.Errorf("Classify(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}

@@ -1167,17 +1167,40 @@ func FindImpact(dbPath, symbolName string, depth, limit int) ([]ImpactResult, er
 // noTests drops test-file callers during traversal. The returned bool reports
 // whether the per-symbol limit truncated the result set.
 func FindImpactWithScope(dbPath, symbolName string, scope ResolveScope, depth, limit int, noTests bool) ([]ImpactResult, bool, error) {
+	return FindImpactWithOptions(dbPath, symbolName, ImpactOptions{
+		Scope: scope, Depth: depth, Limit: limit, NoTests: noTests,
+	})
+}
+
+// ImpactOptions controls FindImpactWithOptions (mirroring TraceOptions).
+type ImpactOptions struct {
+	// Scope is the cross-language resolution scope (family-expanded default).
+	Scope ResolveScope
+	// Depth and Limit bound the BFS; both are clamped (see ClampImpactBounds).
+	Depth, Limit int
+	// NoTests hides test-file callers (hide-but-traverse: their own callers
+	// are still explored).
+	NoTests bool
+	// TestPaths are user-supplied --test-path patterns layered over the
+	// built-in test conventions (see NewClassifier).
+	TestPaths []string
+}
+
+// FindImpactWithOptions is FindImpactWithScope with explicit control over
+// test-caller classification. The returned bool reports whether the
+// per-symbol limit truncated the result set.
+func FindImpactWithOptions(dbPath, symbolName string, opts ImpactOptions) ([]ImpactResult, bool, error) {
 	store, err := openCached(dbPath)
 	if err != nil {
 		return nil, false, err
 	}
 	var langs []string
-	if NormalizeScope(scope) != ResolveScopeAll {
+	if NormalizeScope(opts.Scope) != ResolveScopeAll {
 		if seedLangs, err := store.SymbolLanguages(symbolName); err == nil {
-			langs = scopeLanguagesUnion(seedLangs, scope)
+			langs = scopeLanguagesUnion(seedLangs, opts.Scope)
 		}
 	}
-	return store.findImpactInLangs(symbolName, langs, depth, limit, noTests)
+	return store.findImpactInLangs(symbolName, langs, opts.Depth, opts.Limit, opts.NoTests, NewClassifier(opts.TestPaths))
 }
 
 // FindTrace performs downward call graph traversal for a symbol.

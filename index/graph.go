@@ -75,6 +75,9 @@ type GraphQuery struct {
 	// and callers reachable only through it stay connected to its targets via
 	// synthesized indirect edges (see GraphEdge.Indirect). The root is exempt.
 	NoTests bool
+	// TestPaths are user-supplied --test-path patterns layered over the
+	// built-in test conventions when classifying nodes for NoTests.
+	TestPaths []string
 }
 
 type GraphNode struct {
@@ -249,7 +252,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 				langs = scopeLanguagesUnion(seedLangs, q.ResolveScope)
 			}
 		}
-		rows, truncated, err := s.findImpactInLangs(q.Symbol, langs, q.Depth, graphEdgeRowCap, false)
+		rows, truncated, err := s.findImpactInLangs(q.Symbol, langs, q.Depth, graphEdgeRowCap, false, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +263,7 @@ func (s *Store) BuildGraph(q GraphQuery) (*GraphResult, error) {
 
 	result := builder.result()
 	if q.NoTests {
-		result = contractTestNodes(result, graphNodeID(q.Symbol))
+		result = contractTestNodes(result, graphNodeID(q.Symbol), NewClassifier(q.TestPaths))
 	}
 	if q.Limit > 0 && len(result.Nodes) > q.Limit {
 		result = truncateByDegree(result, q.Limit, graphNodeID(q.Symbol))
@@ -553,13 +556,13 @@ func truncateByDegree(g *GraphResult, limit int, rootID string) *GraphResult {
 // an Indirect edge. A node is contracted only when its definition file
 // classifies confidently as test (unknown/ambiguous stay), and the root never
 // is. A direct edge between two survivors always wins over a synthesized one.
-func contractTestNodes(g *GraphResult, rootID string) *GraphResult {
+func contractTestNodes(g *GraphResult, rootID string, cl *Classifier) *GraphResult {
 	drop := map[string]bool{}
 	for _, n := range g.Nodes {
 		if n.ID == rootID || n.Kind != GraphNodeKindSymbol {
 			continue
 		}
-		if n.Path != "" && ClassifyPath(n.Path) == PathClassTest {
+		if n.Path != "" && cl.Classify(n.Path) == PathClassTest {
 			drop[n.ID] = true
 		}
 	}

@@ -1,6 +1,10 @@
 package index
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/1broseidon/cymbal/internal/pathmatch"
+)
 
 // PathClass categorises a file by its repo-relative path for triage: is a
 // caller production code, test code, or something in between?
@@ -113,4 +117,41 @@ func ClassifyPath(relPath string) PathClass {
 	}
 
 	return PathClassProduction
+}
+
+// Classifier layers user-supplied test-path patterns (--test-path) over the
+// built-in conventions: a path matching any pattern classifies as Test;
+// everything else falls through to ClassifyPath. Patterns use the same
+// semantics as the CLI --path/--exclude filters (pathmatch.MatchAny): plain
+// text matches as a substring, glob metacharacters enable matching with **
+// as a recursive segment. A nil *Classifier is valid and applies only the
+// built-ins, so call sites can thread one unconditionally.
+type Classifier struct {
+	testPatterns []string
+}
+
+// NewClassifier builds a Classifier from --test-path patterns. Blank patterns
+// are dropped; with no usable patterns it returns nil (the built-ins-only
+// classifier).
+func NewClassifier(testPatterns []string) *Classifier {
+	kept := make([]string, 0, len(testPatterns))
+	for _, p := range testPatterns {
+		if strings.TrimSpace(p) != "" {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return &Classifier{testPatterns: kept}
+}
+
+// Classify returns the PathClass for a repo-relative path, honoring the
+// user-supplied test-path patterns first.
+func (c *Classifier) Classify(relPath string) PathClass {
+	if c != nil && relPath != "" &&
+		pathmatch.MatchAny(strings.ReplaceAll(relPath, "\\", "/"), c.testPatterns) {
+		return PathClassTest
+	}
+	return ClassifyPath(relPath)
 }

@@ -65,11 +65,17 @@ func ReferenceFileCountsWithScope(dbPath, symbolName string, scope ResolveScope)
 // FoldReferenceCounts classifies each referencing file path and tallies rows
 // and distinct files per production/test/unknown class.
 func FoldReferenceCounts(perFile map[string]int) ReferenceCounts {
+	return FoldReferenceCountsWith(nil, perFile)
+}
+
+// FoldReferenceCountsWith is FoldReferenceCounts with user-supplied test-path
+// patterns layered over the built-in conventions (nil applies built-ins only).
+func FoldReferenceCountsWith(cl *Classifier, perFile map[string]int) ReferenceCounts {
 	var rc ReferenceCounts
 	for relPath, c := range perFile {
 		rc.Rows += c
 		rc.Files++
-		switch ClassifyPath(relPath) {
+		switch cl.Classify(relPath) {
 		case PathClassTest:
 			rc.TestRows += c
 			rc.TestFiles++

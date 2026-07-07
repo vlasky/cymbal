@@ -59,6 +59,8 @@ when truncated. Operates only on the current worktree.`,
 		maxSymbols, _ := cmd.Flags().GetInt("max-symbols")
 		aggLimit, _ := cmd.Flags().GetInt("max-impact")
 		noTests, _ := cmd.Flags().GetBool("no-tests")
+		testPaths, _ := cmd.Flags().GetStringArray("test-path")
+		classifier := index.NewClassifier(testPaths)
 		staged, _ := cmd.Flags().GetBool("staged")
 		base, _ := cmd.Flags().GetString("base")
 		scope, err := resolveScopeOrError(cmd)
@@ -219,18 +221,20 @@ when truncated. Operates only on the current worktree.`,
 			} else {
 				res.DefinitionError = true
 			}
-			if rc, rerr := index.ReferenceCountsWithScope(dbPath, name, scope); rerr == nil {
-				res.References = rc
+			if perFile, rerr := index.ReferenceFileCountsWithScope(dbPath, name, scope); rerr == nil {
+				res.References = index.FoldReferenceCountsWith(classifier, perFile)
 			} else {
 				res.ReferencesError = true
 			}
 			if aggLimit > 0 && aggRows >= aggLimit {
 				res.ImpactStatus = "cap"
 				impactTruncated = true
-			} else if rows, tr, ierr := index.FindImpactWithScope(dbPath, name, scope, depth, limit, noTests); ierr != nil {
+			} else if rows, tr, ierr := index.FindImpactWithOptions(dbPath, name, index.ImpactOptions{
+				Scope: scope, Depth: depth, Limit: limit, NoTests: noTests, TestPaths: testPaths,
+			}); ierr != nil {
 				res.ImpactStatus = "error"
 			} else {
-				prod, test, unknown := classifyImpact(rows)
+				prod, test, unknown := classifyImpact(classifier, rows)
 				res.Impact = &impactSummary{
 					TotalCallers:      len(rows),
 					ProductionCallers: prod,
@@ -371,6 +375,8 @@ func init() {
 	changedCmd.Flags().Int("max-symbols", 40, "max changed symbols to analyze (0 = unlimited)")
 	changedCmd.Flags().Int("max-impact", 500, "soft cap on total caller rows across symbols; once reached, remaining symbols skip impact (0 = unlimited)")
 	changedCmd.Flags().Bool("no-tests", false, "exclude callers in test files from impact")
+	changedCmd.Flags().StringArray("test-path", nil,
+		"classify paths matching this pattern as test code, in addition to the built-in conventions (substring, or glob with **; repeatable)")
 	addResolveScopeFlag(changedCmd)
 	rootCmd.AddCommand(changedCmd)
 }
