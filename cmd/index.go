@@ -36,13 +36,26 @@ var indexCmd = &cobra.Command{
 		includeGenerated, _ := cmd.Flags().GetBool("include-generated")
 		includeLargeFiles, _ := cmd.Flags().GetBool("include-large-files")
 
-		// Use --db flag > CYMBAL_DB env > compute from target path.
+		// Resolve the repo root for DB path computation. If absPath is a
+		// subdirectory of a git repo, use the repo root for the DB and pass
+		// the subdirectory as a scope.
+		repoRoot := absPath
+		var scope string
+		if gitRoot, gitErr := index.FindGitRoot(absPath); gitErr == nil {
+			gitRootAbs, _ := filepath.Abs(gitRoot)
+			if gitRootAbs != absPath {
+				repoRoot = gitRootAbs
+				scope = absPath
+			}
+		}
+
+		// Use --db flag > CYMBAL_DB env > compute from repo root.
 		dbPath, _ := cmd.Flags().GetString("db")
 		if dbPath == "" {
 			if p := os.Getenv("CYMBAL_DB"); p != "" {
 				dbPath = p
 			} else {
-				dbPath, err = index.RepoDBPath(absPath)
+				dbPath, err = index.RepoDBPath(repoRoot)
 				if err != nil {
 					return fmt.Errorf("computing db path: %w", err)
 				}
@@ -52,12 +65,13 @@ var indexCmd = &cobra.Command{
 		fmt.Fprintf(os.Stderr, "Indexing %s ...\n", absPath)
 		start := time.Now()
 
-		stats, err := index.Index(absPath, dbPath, index.Options{
+		stats, err := index.Index(repoRoot, dbPath, index.Options{
 			Workers:           workers,
 			Force:             force,
 			Exclude:           excludes,
 			IncludeGenerated:  includeGenerated,
 			IncludeLargeFiles: includeLargeFiles,
+			Scope:             scope,
 		})
 		if err != nil {
 			return fmt.Errorf("indexing failed: %w", err)
