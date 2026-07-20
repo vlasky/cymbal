@@ -333,6 +333,15 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	walkPath := root
 	if opts.Scope != "" {
 		walkPath = canonicalPath(opts.Scope)
+		rel, err := filepath.Rel(root, walkPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("scope %s is outside repo root %s", walkPath, root)
+		}
+		if rel == "." {
+			// Scope equals the root: treat as a full unscoped index.
+			opts.Scope = ""
+			walkPath = root
+		}
 	}
 
 	if dbPath == "" {
@@ -349,9 +358,10 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	}
 	defer store.Close()
 
-	// Store repo root in metadata. On scoped runs, set it only if absent
-	// (avoids overwriting with a subtree path, but ensures EnsureFresh works
-	// even if the first-ever index was scoped).
+	// Store repo root in metadata. A scoped run must not overwrite the
+	// stored options with its run-local filter flags, so it only writes
+	// metadata when the DB is brand new (repo_root absent) — that keeps
+	// EnsureFresh working even if the first-ever index was scoped.
 	if opts.Scope == "" {
 		if err := store.SetMeta("repo_root", root); err != nil {
 			return nil, fmt.Errorf("setting repo metadata: %w", err)
@@ -364,27 +374,22 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 			if err := store.SetMeta("repo_root", root); err != nil {
 				return nil, fmt.Errorf("setting repo metadata: %w", err)
 			}
+			if err := storeIndexOptions(store, opts); err != nil {
+				return nil, fmt.Errorf("setting index metadata: %w", err)
+			}
 		}
 	}
 
+	// RelBase keeps RelPath (and exclude matching) repo-relative even when
+	// walking only a subtree.
 	files, walkStats, err := walker.WalkWithOptions(walkPath, workers, lang.Default.Supported, walker.WalkOptions{
 		Exclude:           opts.Exclude,
 		IncludeGenerated:  opts.IncludeGenerated,
 		IncludeLargeFiles: opts.IncludeLargeFiles,
+		RelBase:           root,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("walking directory: %w", err)
-	}
-
-	// When walking a subtree, the walker computes RelPath relative to the
-	// walk path. Rebase to the repo root so stored rel_paths are consistent.
-	if opts.Scope != "" {
-		for i := range files {
-			rel, err := filepath.Rel(root, files[i].Path)
-			if err == nil {
-				files[i].RelPath = rel
-			}
-		}
 	}
 
 	// Load all stored mtime_ns + size in one query for fast skip checks.
