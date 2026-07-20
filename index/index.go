@@ -32,6 +32,7 @@ type Options struct {
 	Exclude           []string
 	IncludeGenerated  bool
 	IncludeLargeFiles bool
+	Scope             string // if set, only index/prune files under this subtree
 }
 
 // Stats reports indexing results.
@@ -328,6 +329,12 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	}
 	root = canonicalPath(root)
 
+	// Determine the walk path: use Scope if set, otherwise root.
+	walkPath := root
+	if opts.Scope != "" {
+		walkPath = canonicalPath(opts.Scope)
+	}
+
 	if dbPath == "" {
 		var err error
 		dbPath, err = RepoDBPath(root)
@@ -342,21 +349,42 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	}
 	defer store.Close()
 
-	// Store repo root in metadata.
-	if err := store.SetMeta("repo_root", root); err != nil {
-		return nil, fmt.Errorf("setting repo metadata: %w", err)
-	}
-	if err := storeIndexOptions(store, opts); err != nil {
-		return nil, fmt.Errorf("setting index metadata: %w", err)
+	// Store repo root in metadata. On scoped runs, set it only if absent
+	// (avoids overwriting with a subtree path, but ensures EnsureFresh works
+	// even if the first-ever index was scoped).
+	if opts.Scope == "" {
+		if err := store.SetMeta("repo_root", root); err != nil {
+			return nil, fmt.Errorf("setting repo metadata: %w", err)
+		}
+		if err := storeIndexOptions(store, opts); err != nil {
+			return nil, fmt.Errorf("setting index metadata: %w", err)
+		}
+	} else {
+		if existing, _ := store.GetMeta("repo_root"); existing == "" {
+			if err := store.SetMeta("repo_root", root); err != nil {
+				return nil, fmt.Errorf("setting repo metadata: %w", err)
+			}
+		}
 	}
 
-	files, walkStats, err := walker.WalkWithOptions(root, workers, lang.Default.Supported, walker.WalkOptions{
+	files, walkStats, err := walker.WalkWithOptions(walkPath, workers, lang.Default.Supported, walker.WalkOptions{
 		Exclude:           opts.Exclude,
 		IncludeGenerated:  opts.IncludeGenerated,
 		IncludeLargeFiles: opts.IncludeLargeFiles,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("walking directory: %w", err)
+	}
+
+	// When walking a subtree, the walker computes RelPath relative to the
+	// walk path. Rebase to the repo root so stored rel_paths are consistent.
+	if opts.Scope != "" {
+		for i := range files {
+			rel, err := filepath.Rel(root, files[i].Path)
+			if err == nil {
+				files[i].RelPath = rel
+			}
+		}
 	}
 
 	// Load all stored mtime_ns + size in one query for fast skip checks.
@@ -366,11 +394,17 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	}
 
 	// Phase 0: prune stale files (deleted/renamed since last index).
+	// When scoped to a subtree, only prune files under that subtree.
 	currentPaths := make(map[string]struct{}, len(files))
 	for _, f := range files {
 		currentPaths[f.Path] = struct{}{}
 	}
-	staleRemoved, _ := store.DeleteStalePaths(currentPaths)
+	var staleRemoved int
+	if opts.Scope == "" {
+		staleRemoved, _ = store.DeleteStalePaths(currentPaths)
+	} else {
+		staleRemoved, _ = store.DeleteStalePathsUnder(walkPath, currentPaths)
+	}
 
 	// (parseResult is defined at package level)
 
