@@ -349,13 +349,21 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	}
 	defer store.Close()
 
-	// Only store repo root when indexing the full root (not a subtree).
+	// Store repo root in metadata. On scoped runs, set it only if absent
+	// (avoids overwriting with a subtree path, but ensures EnsureFresh works
+	// even if the first-ever index was scoped).
 	if opts.Scope == "" {
 		if err := store.SetMeta("repo_root", root); err != nil {
 			return nil, fmt.Errorf("setting repo metadata: %w", err)
 		}
 		if err := storeIndexOptions(store, opts); err != nil {
 			return nil, fmt.Errorf("setting index metadata: %w", err)
+		}
+	} else {
+		if existing, _ := store.GetMeta("repo_root"); existing == "" {
+			if err := store.SetMeta("repo_root", root); err != nil {
+				return nil, fmt.Errorf("setting repo metadata: %w", err)
+			}
 		}
 	}
 
@@ -366,6 +374,17 @@ func Index(root, dbPath string, opts Options) (*Stats, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("walking directory: %w", err)
+	}
+
+	// When walking a subtree, the walker computes RelPath relative to the
+	// walk path. Rebase to the repo root so stored rel_paths are consistent.
+	if opts.Scope != "" {
+		for i := range files {
+			rel, err := filepath.Rel(root, files[i].Path)
+			if err == nil {
+				files[i].RelPath = rel
+			}
+		}
 	}
 
 	// Load all stored mtime_ns + size in one query for fast skip checks.

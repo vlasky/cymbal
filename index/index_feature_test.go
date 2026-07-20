@@ -603,6 +603,12 @@ func SubHelper() string {
 	}
 	if len(results) == 0 {
 		t.Error("expected SubHelper (from subdir) to be in DB")
+	} else {
+		// rel_path must be relative to the repo root, not the walk scope.
+		want := filepath.Join("sub", "helper.go")
+		if results[0].RelPath != want {
+			t.Errorf("SubHelper rel_path = %q, want %q", results[0].RelPath, want)
+		}
 	}
 }
 
