@@ -19,7 +19,7 @@ Pointing at a subdirectory of a git repo updates the repo's index in place,
 restricted to that subtree: files outside the subtree are neither reparsed
 nor pruned. Filter flags (--exclude, --include-*) on a subtree run apply to
 that run only; later query refreshes use the options from the last full index.`,
-	Args:  cobra.MaximumNArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := "."
 		if len(args) > 0 {
