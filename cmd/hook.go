@@ -802,14 +802,36 @@ const reminderText = `This project is indexed by cymbal. Use cymbal for structur
 
 Default workflow:
   1. ` + "`cymbal search <name>`" + ` to locate a symbol or file by name.
-  2. ` + "`cymbal show <sym>`" + ` to read source, or ` + "`cymbal investigate <sym>`" + ` for a quick summary.
+  2. ` + "`cymbal context <sym>`" + ` for source + callers + imports in one call, or ` + "`cymbal show <sym>`" + ` to read source, or ` + "`cymbal investigate <sym>`" + ` for a quick summary.
   3. ` + "`cymbal impact <sym>`" + `, ` + "`cymbal trace <sym>`" + `, and ` + "`cymbal impls <sym>`" + ` to follow callers, dependencies, and implementations.
+
+Orientation (new repo or file):
+  - ` + "`cymbal structure`" + ` for entry points, hotspots, and most-referenced symbols.
+  - ` + "`cymbal outline <file>`" + ` for the symbol map of a file before editing.
+  - ` + "`cymbal ls --stats`" + ` for repo overview (languages, file/symbol counts).
+
+Reading source:
+  - ` + "`cymbal show <sym>`" + ` to read a function/type by name.
+  - ` + "`cymbal show Parent.child`" + ` for nested symbols (e.g. a function inside a React component).
+  - ` + "`cymbal show file.ts:80-120`" + ` to read a line range without the whole file.
+
+Assessing change risk:
+  - ` + "`cymbal changed`" + ` for diff-scoped impact of uncommitted edits.
+  - ` + "`cymbal changed --staged`" + ` or ` + "`cymbal changed --base main`" + ` for staged/branch diffs.
+  - ` + "`cymbal diff <sym> [base]`" + ` for the git diff scoped to one symbol's line range.
+  - ` + "`cymbal impact <sym>`" + ` for transitive caller analysis.
+
+Finding things:
+  - ` + "`cymbal search <name>`" + ` for symbol lookup (ranked: exact > prefix > fuzzy).
+  - ` + "`cymbal search --text <pattern>`" + ` for literal text or regex grep.
+  - ` + "`cymbal refs <sym>`" + ` for all reference sites of a symbol.
+  - ` + "`cymbal importers <file>`" + ` for reverse import lookup.
 
 Batch related lookups in one call when possible: ` + "`cymbal search Foo Bar`" + `, ` + "`cymbal show Foo Bar`" + `, ` + "`cymbal investigate Foo Bar`" + `, or pipe newline-separated symbols via ` + "`--stdin`" + `.
 
 Prefer ` + "`cymbal search`" + ` over the Grep tool (or rg/grep) for symbol/function/class lookup. Prefer ` + "`cymbal show`" + ` over Read when reading source by symbol name. Prefer ` + "`cymbal investigate / impact / trace / impls`" + ` over manual cross-referencing.
 
-Use ` + "`cymbal search --text <pattern>`" + ` only for literal text or regex. Use Grep/Glob/Read (or rg/grep/find) for: literal text in non-code files (markdown, JSON, logs, config), files outside the indexed repo, and direct path reads when you already know the path.
+Use Grep/Glob/Read (or rg/grep/find) for: literal text in non-code files (markdown, JSON, logs, config), files outside the indexed repo, and direct path reads when you already know the path.
 
 Cymbal is for structural queries (known names, call graphs, references). For semantic/conceptual queries ("find code related to X") where you don't know the exact symbol name, prefer a semantic search tool if one is configured.`
 
