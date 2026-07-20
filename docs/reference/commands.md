@@ -222,9 +222,9 @@ cymbal show handleAuth -C 5
 
 ## `cymbal context`
 
-Show bundled context for a symbol: source code, referenced types, callers, and
-imports of the defining file. The single best command for "I'm about to edit
-this symbol".
+Show bundled context for a symbol: source code, callers, and imports of the
+defining file (plus referenced types in `--json` output). The single best
+command for "I'm about to edit this symbol".
 
 ```sh
 cymbal context <symbol> [flags]
@@ -253,7 +253,7 @@ cymbal diff <symbol> [base] [flags]
 
 | Flag | Description |
 |------|-------------|
-| `--stat` | Show diffstat instead of full diff |
+| `--stat` | Show diffstat for the whole defining file (not symbol-filtered) |
 
 ```sh
 # diff vs HEAD

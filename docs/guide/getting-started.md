@@ -85,7 +85,7 @@ Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bas
 - **To understand a symbol**: `cymbal context <symbol>` — source + callers + imports in one call. Or `cymbal investigate <symbol>` for a kind-adaptive summary.
 - **To understand multiple symbols**: `cymbal investigate Foo Bar Baz` — batch mode, one invocation.
 - **To trace an execution path**: `cymbal trace <symbol>` — follows the call graph downward.
-- **To assess change risk**: `cymbal changed` (uncommitted edits), `cymbal changed --base main` (branch diff), or `cymbal impact <symbol>` (transitive callers).
+- **To assess change risk**: `cymbal changed` (unstaged edits; `--staged` for staged), `cymbal changed --base main` (working tree vs main), or `cymbal impact <symbol>` (transitive callers).
 - **To review a symbol's diff**: `cymbal diff <symbol> [base]` — git diff scoped to one function's line range.
 - Before reading a file: `cymbal outline <file>` or `cymbal show <file:L1-L2>`
 - Read nested symbols: `cymbal show Parent.child` (e.g. a function inside a React component).

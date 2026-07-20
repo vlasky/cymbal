@@ -800,10 +800,7 @@ func emitNudge(stdout, stderr io.Writer, format string, fields []string, s Sugge
 // to treat as persistent context. Short by design.
 const reminderText = `This project is indexed by cymbal. Use cymbal for structural code navigation when you know (or can guess) the symbol name.
 
-Default workflow:
-  1. ` + "`cymbal search <name>`" + ` to locate a symbol or file by name.
-  2. ` + "`cymbal context <sym>`" + ` for source + callers + imports in one call, or ` + "`cymbal show <sym>`" + ` to read source, or ` + "`cymbal investigate <sym>`" + ` for a quick summary.
-  3. ` + "`cymbal impact <sym>`" + `, ` + "`cymbal trace <sym>`" + `, and ` + "`cymbal impls <sym>`" + ` to follow callers, dependencies, and implementations.
+Typical flow: ` + "`cymbal search <name>`" + ` to locate -> ` + "`cymbal context/show/investigate <sym>`" + ` to read -> ` + "`cymbal impact/trace/impls <sym>`" + ` to follow callers, dependencies, and implementations.
 
 Orientation (new repo or file):
   - ` + "`cymbal structure`" + ` for entry points, hotspots, and most-referenced symbols.
@@ -811,21 +808,21 @@ Orientation (new repo or file):
   - ` + "`cymbal ls --stats`" + ` for repo overview (languages, file/symbol counts).
 
 Reading source:
-  - ` + "`cymbal show <sym>`" + ` to read a function/type by name.
-  - ` + "`cymbal show Parent.child`" + ` for nested symbols (e.g. a function inside a React component).
-  - ` + "`cymbal show file.ts:80-120`" + ` to read a line range without the whole file.
+  - ` + "`cymbal context <sym>`" + ` for source + callers + imports in one call.
+  - ` + "`cymbal show <sym>`" + ` to read a function/type by name; ` + "`cymbal show Parent.child`" + ` for nested symbols; ` + "`cymbal show file.ts:80-120`" + ` for a line range.
+  - ` + "`cymbal investigate <sym>`" + ` for a kind-adaptive summary.
+
+Following relationships:
+  - ` + "`cymbal impact <sym>`" + ` for transitive callers, ` + "`cymbal trace <sym>`" + ` for the call graph downward, ` + "`cymbal impls <sym>`" + ` for implementations.
+  - ` + "`cymbal refs <sym>`" + ` for reference sites (best-effort), ` + "`cymbal importers <file>`" + ` for reverse import lookup.
 
 Assessing change risk:
-  - ` + "`cymbal changed`" + ` for diff-scoped impact of uncommitted edits.
-  - ` + "`cymbal changed --staged`" + ` or ` + "`cymbal changed --base main`" + ` for staged/branch diffs.
+  - ` + "`cymbal changed`" + ` for diff-scoped impact of unstaged edits; ` + "`--staged`" + ` for staged edits, ` + "`--base <ref>`" + ` for working tree vs a base ref.
   - ` + "`cymbal diff <sym> [base]`" + ` for the git diff scoped to one symbol's line range.
-  - ` + "`cymbal impact <sym>`" + ` for transitive caller analysis.
 
 Finding things:
   - ` + "`cymbal search <name>`" + ` for symbol lookup (ranked: exact > prefix > fuzzy).
   - ` + "`cymbal search --text <pattern>`" + ` for literal text or regex grep.
-  - ` + "`cymbal refs <sym>`" + ` for all reference sites of a symbol.
-  - ` + "`cymbal importers <file>`" + ` for reverse import lookup.
 
 Batch related lookups in one call when possible: ` + "`cymbal search Foo Bar`" + `, ` + "`cymbal show Foo Bar`" + `, ` + "`cymbal investigate Foo Bar`" + `, or pipe newline-separated symbols via ` + "`--stdin`" + `.
 
