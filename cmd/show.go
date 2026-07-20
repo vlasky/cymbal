@@ -29,6 +29,7 @@ multiple reads in a single turn.
 
 Examples:
   cymbal show ParseFile                        # show symbol source
+  cymbal show App.handleSave                   # show nested symbol by qualified name
   cymbal show internal/index/store.go          # show full file
   cymbal show internal/index/store.go:80-120   # show lines 80-120
   cymbal show Foo Bar Baz                      # batch: three symbols at once
