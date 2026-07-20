@@ -13,7 +13,12 @@ import (
 var indexCmd = &cobra.Command{
 	Use:   "index [path]",
 	Short: "Index a directory for symbol discovery",
-	Long:  `Index a directory for symbol discovery.`,
+	Long: `Index a directory for symbol discovery.
+
+Pointing at a subdirectory of a git repo updates the repo's index in place,
+restricted to that subtree: files outside the subtree are neither reparsed
+nor pruned. Filter flags (--exclude, --include-*) on a subtree run apply to
+that run only; later query refreshes use the options from the last full index.`,
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := "."
@@ -29,6 +34,11 @@ var indexCmd = &cobra.Command{
 		if _, err := os.Stat(absPath); err != nil {
 			return fmt.Errorf("path not found: %s", absPath)
 		}
+		// Resolve symlinks so git-root detection (a lexical climb) sees the
+		// real location; otherwise a symlinked path gets an orphaned DB.
+		if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+			absPath = resolved
+		}
 
 		workers, _ := cmd.Flags().GetInt("workers")
 		force, _ := cmd.Flags().GetBool("force")
@@ -41,12 +51,9 @@ var indexCmd = &cobra.Command{
 		// the subdirectory as a scope.
 		repoRoot := absPath
 		var scope string
-		if gitRoot, gitErr := index.FindGitRoot(absPath); gitErr == nil {
-			gitRootAbs, _ := filepath.Abs(gitRoot)
-			if gitRootAbs != absPath {
-				repoRoot = gitRootAbs
-				scope = absPath
-			}
+		if gitRoot, gitErr := index.FindGitRoot(absPath); gitErr == nil && gitRoot != absPath {
+			repoRoot = gitRoot
+			scope = absPath
 		}
 
 		// Use --db flag > CYMBAL_DB env > compute from repo root.
@@ -59,6 +66,12 @@ var indexCmd = &cobra.Command{
 				if err != nil {
 					return fmt.Errorf("computing db path: %w", err)
 				}
+			}
+		}
+
+		if scope != "" && (len(excludes) > 0 || includeGenerated || includeLargeFiles) {
+			if _, err := os.Stat(dbPath); err == nil {
+				fmt.Fprintln(os.Stderr, "note: filter flags on a subtree index apply to this run only; later refreshes use the options from the last full index")
 			}
 		}
 
