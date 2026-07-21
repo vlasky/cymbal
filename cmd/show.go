@@ -15,12 +15,17 @@ import (
 )
 
 var showCmd = &cobra.Command{
-	Use:   "show <symbol|file[:L1-L2]> [symbol2 ...]",
+	Use:   "show <symbol|file[:L1-L2|:Symbol]> [symbol2 ...]",
 	Short: "Read source by symbol name or file path",
 	Long: `Show source code for a symbol or file.
 
 If the argument contains '/' or ends with a known extension, it's treated as a file path.
 Otherwise, it's treated as a symbol name.
+
+File-scoped symbol lookup: use file.go:SymbolName to find a symbol defined in
+a specific file. Useful for disambiguating common names (Handler, Config) without
+needing the qualified Parent.child syntax. Falls back to global search if no
+match is found in the specified file.
 
 Multi-symbol mode: pass more than one symbol, or pipe newline-separated names
 via --stdin, and show will render each one under a "═══ <name> ═══" header.
@@ -29,6 +34,8 @@ multiple reads in a single turn.
 
 Examples:
   cymbal show ParseFile                        # show symbol source
+  cymbal show App.handleSave                   # show nested symbol by qualified name
+  cymbal show store.go:SearchSymbols           # show symbol scoped to file
   cymbal show internal/index/store.go          # show full file
   cymbal show internal/index/store.go:80-120   # show lines 80-120
   cymbal show Foo Bar Baz                      # batch: three symbols at once
@@ -196,6 +203,9 @@ func buildShowSymbolPayload(dbPath, name string, ctx int, showAll bool, includes
 	}
 	allResults := filterByPath(res.Results, func(r index.SymbolResult) string { return r.RelPath }, includes, excludes)
 	if len(allResults) == 0 {
+		if file, sym := parseSymbolArg(name); file != "" {
+			return nil, fmt.Errorf("symbol not found: %s (scoped to %s)", sym, file)
+		}
 		return nil, fmt.Errorf("symbol not found: %s", name)
 	}
 	displayResults := allResults
@@ -427,6 +437,9 @@ func showSymbol(dbPath, name string, ctx int, jsonOut, showAll bool, includes, e
 
 	allResults := filterByPath(res.Results, func(r index.SymbolResult) string { return r.RelPath }, includes, excludes)
 	if len(allResults) == 0 {
+		if file, sym := parseSymbolArg(name); file != "" {
+			return fmt.Errorf("symbol not found: %s (scoped to %s)", sym, file)
+		}
 		return fmt.Errorf("symbol not found: %s", name)
 	}
 	displayResults := allResults
